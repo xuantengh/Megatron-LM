@@ -1,0 +1,328 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+"""Host front-end for the Blackwell CuTe DSL Gated Delta Product (GDP) kernel.
+
+The public entry point :func:`chunk_gated_delta_product_cutedsl` is a drop-in
+replacement for ``fla.ops.gated_delta_product.chunk_gated_delta_product`` as
+called by :class:`~megatron.core.ssm.gated_delta_product.GatedDeltaProductMixer`,
+so the mixer can dispatch to either backend without reshaping anything.
+
+Timelines
+---------
+GDP runs on two interleaved timelines and nearly every shape bug comes from
+confusing them:
+
+* **token timeline** (length ``T``) — carries ``q``, ``g``, and the output ``o``.
+* **delta-product timeline** (length ``T * M``, ``M = num_householder``) —
+  carries ``k``, ``v``, ``beta``, and the interleaved decay ``g_interleaved``.
+
+Each token applies ``M`` sequential rank-1 delta updates to the ``K x V`` matrix
+state, with the gate applied once at the first of those ``M`` sub-steps, and then
+performs a single query readout. Varlen boundaries follow the same split:
+``cu_seqlens`` is in token units and ``cu_seqlens * M`` in sub-step units.
+
+Preprocessing the kernel does NOT do (and that this front-end performs, matching
+FLA semantics): the householder interleaving of ``g``, the per-chunk local
+cumsum on both timelines, and the optional L2 normalization of ``q`` / ``k``.
+See :mod:`._gdp_preprocess`.
+"""
+
+import logging
+from typing import Type
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass.cute.runtime import from_dlpack
+
+from ._gdp_kernel import GDPKernel
+from ._gdp_preprocess import fused_gdp_gate_preprocess, l2norm_fwd
+
+logger = logging.getLogger(__name__)
+
+# Kernel chunk length (tokens per chunk on the token timeline). The delta-product
+# timeline is chunked at KERNEL_CHUNK_SIZE * M. Matches FLA's hardcoded 64 so the
+# two backends produce bit-comparable chunk boundaries.
+KERNEL_CHUNK_SIZE = 64
+
+# Supported (K, V) head-dimension pairs. Extend as tile shapes are added.
+SUPPORTED_HEAD_DIMS = ((128, 128),)
+
+_MAX_ACTIVE_CLUSTERS = None
+_COMPILE_CACHE: dict = {}
+_WORKSPACE_CACHE: dict = {}
+
+
+def is_cutedsl_gdp_available() -> bool:
+    """Return ``True`` if the CuTe DSL runtime is importable and the GPU is sm100+.
+
+    Returns:
+        Whether :func:`chunk_gated_delta_product_cutedsl` can be called at all.
+        A ``True`` result does not imply a given batch is supported — use
+        :func:`cutedsl_gdp_unsupported_reason` for the per-call guard.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 10
+
+
+def _torch_to_cute_dtype(dtype: torch.dtype) -> Type[cutlass.Numeric]:
+    """Map a torch io dtype onto the corresponding CuTe DSL numeric type."""
+    if dtype == torch.bfloat16:
+        return cutlass.BFloat16
+    if dtype == torch.float16:
+        return cutlass.Float16
+    raise ValueError(f"Unsupported io dtype for CuTe DSL GDP kernel: {dtype}")
+
+
+def _to_cute(torch_tensor: torch.Tensor, dynamic_modes: list[int]) -> cute.Tensor:
+    """Convert a ``torch.Tensor`` to a ``cute.Tensor`` via dlpack, marking dynamic modes."""
+    ct = from_dlpack(torch_tensor, assumed_align=16)
+    stride_order = torch_tensor.dim_order()
+    for mode in dynamic_modes:
+        ct = ct.mark_compact_shape_dynamic(mode=mode, stride_order=stride_order)
+    return ct
+
+
+def _current_cute_stream() -> cuda.CUstream:
+    """Return the current torch CUDA stream as a CUDA driver stream handle."""
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+def _chunk_meta(cu_seqlens: torch.Tensor, num_householder: int, chunk_size: int) -> dict:
+    """Derive the host-side launch metadata for one varlen batch.
+
+    Computes, for both the token and delta-product timelines, the per-sequence
+    chunk counts and start offsets that the persistent tile scheduler walks, plus
+    the divisibility flag the dispatch guard keys on.
+
+    Args:
+        cu_seqlens: Cumulative token counts, shape ``[N + 1]``, token units.
+        num_householder: ``M``, the number of householder sub-steps per token.
+        chunk_size: Kernel chunk length on the token timeline.
+
+    Returns:
+        A dict with ``N``, ``n_real_tokens``, ``total_chunks``, ``divisible``,
+        ``seq_chunk_start`` and ``seq_n_chunks`` (both int32 CUDA tensors).
+    """
+    raise NotImplementedError("_chunk_meta: derive per-sequence chunk offsets and counts")
+
+
+def cutedsl_gdp_unsupported_reason(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor | None,
+    beta: torch.Tensor,
+    num_householder: int,
+    *,
+    initial_state: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = KERNEL_CHUNK_SIZE,
+) -> str | None:
+    """Check whether this batch can run on the CuTe DSL GDP kernel.
+
+    Mirrors ``cutedsl_unsupported_reason`` in the sibling SSD package: callers
+    dispatch to FLA whenever this returns a non-``None`` reason, so every
+    restriction must be stated here rather than asserted inside the kernel.
+
+    Args:
+        q: Queries, ``[B, T, H, K]``, on the token timeline.
+        k: Keys, ``[B, T * M, H, K]``, on the delta-product timeline.
+        v: Values, ``[B, T * M, H, V]``.
+        g: Log-space forget gate, ``[B, T, H]``, or ``None`` for the ungated variant.
+        beta: Delta-rule step sizes, ``[B, T * M, H]``.
+        num_householder: ``M``.
+        initial_state: Optional carried state, ``[N, H, K, V]``.
+        cu_seqlens: Cumulative token counts, ``[N + 1]``, token units.
+        chunk_size: Kernel chunk length on the token timeline.
+
+    Returns:
+        ``None`` if the batch is supported, else a human-readable reason string.
+    """
+    if not is_cutedsl_gdp_available():
+        return "CuTeDSL GDP: runtime unavailable or pre-Blackwell GPU"
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        return f"CuTeDSL GDP: unsupported io dtype {q.dtype}"
+    if (q.shape[-1], v.shape[-1]) not in SUPPORTED_HEAD_DIMS:
+        return f"CuTeDSL GDP: unsupported (K, V) head dims ({q.shape[-1]}, {v.shape[-1]})"
+    if cu_seqlens is not None and q.shape[0] != 1:
+        return "CuTeDSL GDP: varlen batches must be flattened to B == 1"
+    raise NotImplementedError("cutedsl_gdp_unsupported_reason: add chunk-divisibility guard")
+
+
+def _get_workspace(key: tuple, *shape_args, stream: cuda.CUstream) -> dict:
+    """Get-or-create the cached device workspace and compiled kernel for a shape key.
+
+    The workspace holds the buffers whose shapes depend only on the key (the
+    interleaved and cumulative gates, the packed final-state buffer, the tile
+    scheduler's per-sequence index tensors) together with their ``cute.Tensor``
+    descriptors, so that steady-state calls allocate nothing and rebuild no
+    descriptors.
+
+    Args:
+        key: Shape/feature-flag tuple identifying this workspace.
+        shape_args: Unpacked problem dimensions used to size the buffers.
+        stream: Stream the compilation is issued on.
+
+    Returns:
+        A dict of buffers, ``cute.Tensor`` descriptors and the compiled kernel.
+    """
+    raise NotImplementedError("_get_workspace: allocate buffers, build descriptors, compile")
+
+
+def _get_compiled(
+    io_dtype: Type[cutlass.Numeric],
+    chunk_size: int,
+    head_dim_k: int,
+    head_dim_v: int,
+    num_householder: int,
+    has_initial: bool,
+    output_final_state: bool,
+    *tensor_descriptors,
+    stream: cuda.CUstream,
+):
+    """Compile (and cache) :class:`._gdp_kernel.GDPKernel` for one shape/feature key.
+
+    Args:
+        io_dtype: CuTe numeric type of ``q``/``k``/``v``.
+        chunk_size: Kernel chunk length on the token timeline.
+        head_dim_k: ``K``, the q/k head dimension (the SSM state dimension).
+        head_dim_v: ``V``, the v head dimension.
+        num_householder: ``M``.
+        has_initial: Whether the state is seeded from ``initial_state``.
+        output_final_state: Whether the final state is written out.
+        tensor_descriptors: Placeholder ``cute.Tensor`` args matching the kernel
+            signature, used only to specialize the compile.
+        stream: Stream the compilation is issued on.
+
+    Returns:
+        The compiled kernel, callable with the real tensors.
+    """
+    global _MAX_ACTIVE_CLUSTERS
+    if _MAX_ACTIVE_CLUSTERS is None:
+        _MAX_ACTIVE_CLUSTERS = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+
+    key = (
+        io_dtype,
+        chunk_size,
+        head_dim_k,
+        head_dim_v,
+        num_householder,
+        has_initial,
+        output_final_state,
+    )
+    compiled = _COMPILE_CACHE.get(key)
+    if compiled is None:
+        kernel = GDPKernel(
+            io_dtype=io_dtype,
+            gate_dtype=cutlass.Float32,
+            acc_dtype=cutlass.Float32,
+            chunk_size=chunk_size,
+            head_dim_k=head_dim_k,
+            head_dim_v=head_dim_v,
+            num_householder=num_householder,
+            has_initial=has_initial,
+            output_final_state=output_final_state,
+        )
+        compiled = cute.compile(kernel, *tensor_descriptors, _MAX_ACTIVE_CLUSTERS, stream)
+        _COMPILE_CACHE[key] = compiled
+    return compiled
+
+
+def chunk_gated_delta_product_cutedsl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor | None,
+    beta: torch.Tensor,
+    num_householder: int,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    chunk_size: int = KERNEL_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the chunked Gated Delta Product recurrence on the CuTe DSL kernel.
+
+    Signature-compatible with ``fla.ops.gated_delta_product.chunk_gated_delta_product``
+    so it can be swapped in at the mixer's call site. Callers must first check
+    :func:`cutedsl_gdp_unsupported_reason` and fall back to FLA on a non-``None``
+    result; this function assumes a supported batch and does not re-validate.
+
+    Args:
+        q: Queries, ``[B, T, H, K]``.
+        k: Keys, ``[B, T * M, H, K]``.
+        v: Values, ``[B, T * M, H, V]``.
+        g: Log-space forget gate, ``[B, T, H]``, or ``None`` for the ungated variant.
+        beta: Delta-rule step sizes, ``[B, T * M, H]``, already passed through sigmoid.
+        num_householder: ``M``, the number of householder sub-steps per token.
+        scale: Query scale. Defaults to ``K ** -0.5``.
+        initial_state: Optional carried state, ``[N, H, K, V]``. ``N`` must equal
+            ``len(cu_seqlens) - 1`` when ``cu_seqlens`` is given.
+        output_final_state: Whether to return the final state.
+        use_qk_l2norm_in_kernel: L2-normalize ``q`` and ``k`` in the preprocessing
+            pass instead of requiring the caller to do it.
+        cu_seqlens: Cumulative token counts, ``[N + 1]``, token units (never
+            pre-multiplied by ``M``). Requires ``B == 1``.
+        cu_seqlens_cpu: Optional CPU mirror of ``cu_seqlens``, used to build the
+            scheduler index tensors without a device-to-host sync.
+        chunk_size: Kernel chunk length on the token timeline.
+
+    Returns:
+        A tuple ``(o, final_state)`` where ``o`` has shape ``[B, T, H, V]`` and
+        ``final_state`` has shape ``[N, H, K, V]`` (or is ``None`` when
+        ``output_final_state`` is ``False``).
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    M = num_householder
+    if scale is None:
+        scale = K**-0.5
+
+    assert k.shape == (B, T * M, H, K), f"k must be on the delta-product timeline, got {k.shape}"
+    assert v.shape == (B, T * M, H, V), f"v must be on the delta-product timeline, got {v.shape}"
+    assert beta.shape == (
+        B,
+        T * M,
+        H,
+    ), f"beta must be on the delta-product timeline, got {beta.shape}"
+    if g is not None:
+        assert g.shape == (B, T, H), f"g must be on the token timeline, got {g.shape}"
+
+    io_dtype = q.dtype
+    cute_io_dtype = _torch_to_cute_dtype(io_dtype)
+    stream = _current_cute_stream()
+
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    meta = _chunk_meta(cu_seqlens, M, chunk_size)
+
+    # Build g_interleaved on the delta-product timeline and the two chunk-local
+    # cumsums, in one fused launch. See _gdp_preprocess for the exact semantics.
+    g_cumsum, g_interleaved_cumsum = fused_gdp_gate_preprocess(
+        g, num_householder=M, chunk_size=chunk_size, cu_seqlens=cu_seqlens, meta=meta
+    )
+
+    key = (
+        meta["N"],
+        H,
+        K,
+        V,
+        M,
+        chunk_size,
+        io_dtype,
+        initial_state is not None,
+        output_final_state,
+    )
+    ws = _get_workspace(key, stream=stream)  # noqa: F841 - consumed by the launch below
+
+    raise NotImplementedError(
+        "chunk_gated_delta_product_cutedsl: pack operands into workspace descriptors "
+        "and launch ws['compiled']"
+    )
