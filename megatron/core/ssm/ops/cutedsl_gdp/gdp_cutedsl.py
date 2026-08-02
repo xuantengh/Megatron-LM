@@ -34,19 +34,25 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
+from fla.ops.utils.index import prepare_chunk_indices
 
 from ._gdp_kernel import GDPKernel
 from ._gdp_preprocess import fused_gdp_gate_preprocess, l2norm_fwd
 
 logger = logging.getLogger(__name__)
 
-# Kernel chunk length (tokens per chunk on the token timeline). The delta-product
-# timeline is chunked at KERNEL_CHUNK_SIZE * M. Matches FLA's hardcoded 64 so the
-# two backends produce bit-comparable chunk boundaries.
+# Kernel chunk length. Applied in each timeline's own units, exactly as FLA does:
+# the WY stages chunk the delta-product timeline every KERNEL_CHUNK_SIZE
+# *sub-steps*, while the state and readout stages chunk the token timeline every
+# KERNEL_CHUNK_SIZE *tokens*. One token-chunk therefore spans exactly M WY
+# sub-chunks. Matches FLA's hardcoded 64 so the two backends share chunk
+# boundaries and stay numerically comparable.
 KERNEL_CHUNK_SIZE = 64
 
-# Supported (K, V) head-dimension pairs. Extend as tile shapes are added.
-SUPPORTED_HEAD_DIMS = ((128, 128),)
+# Supported (K, V) head-dimension pairs. K is mamba_state_dim, V is
+# mamba_head_dim -- these are asymmetric by default in GDP (128, 64); GDN-style
+# configs use (128, 128). Extend as tile shapes are added.
+SUPPORTED_HEAD_DIMS = ((128, 64), (128, 128))
 
 _MAX_ACTIVE_CLUSTERS = None
 _COMPILE_CACHE: dict = {}
@@ -104,9 +110,37 @@ def _chunk_meta(cu_seqlens: torch.Tensor, num_householder: int, chunk_size: int)
 
     Returns:
         A dict with ``N``, ``n_real_tokens``, ``total_chunks``, ``divisible``,
-        ``seq_chunk_start`` and ``seq_n_chunks`` (both int32 CUDA tensors).
+        ``seq_chunk_start`` and ``seq_n_chunks`` (both int32 CUDA tensors), and
+        the cached ``chunk_indices`` / ``chunk_indices_dp`` tables.
     """
-    raise NotImplementedError("_chunk_meta: derive per-sequence chunk offsets and counts")
+    device = cu_seqlens.device
+    bounds = cu_seqlens.tolist()  # one D2H sync; amortized by the workspace cache
+    lens = [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)]
+    n_seq = len(lens)
+
+    # The persistent scheduler walks whole chunks, so a partial tail would need
+    # per-chunk predication that the v1 kernel does not implement. Divisibility on
+    # the token timeline implies it on the delta-product timeline as well, since
+    # that one is exactly M times longer.
+    divisible = all(length % chunk_size == 0 for length in lens)
+
+    chunks_per_seq = [(length + chunk_size - 1) // chunk_size for length in lens]
+    starts, running = [], 0
+    for count in chunks_per_seq:
+        starts.append(running)
+        running += count
+
+    return {
+        "N": n_seq,
+        "n_real_tokens": bounds[-1],
+        "total_chunks": running,
+        "divisible": divisible,
+        "seq_lens": lens,
+        "seq_chunk_start": torch.tensor(starts, dtype=torch.int32, device=device),
+        "seq_n_chunks": torch.tensor(chunks_per_seq, dtype=torch.int32, device=device),
+        "chunk_indices": prepare_chunk_indices(cu_seqlens, chunk_size),
+        "chunk_indices_dp": prepare_chunk_indices(cu_seqlens * num_householder, chunk_size),
+    }
 
 
 def cutedsl_gdp_unsupported_reason(
@@ -149,7 +183,22 @@ def cutedsl_gdp_unsupported_reason(
         return f"CuTeDSL GDP: unsupported (K, V) head dims ({q.shape[-1]}, {v.shape[-1]})"
     if cu_seqlens is not None and q.shape[0] != 1:
         return "CuTeDSL GDP: varlen batches must be flattened to B == 1"
-    raise NotImplementedError("cutedsl_gdp_unsupported_reason: add chunk-divisibility guard")
+    if g is None:
+        return "CuTeDSL GDP: the ungated (pure delta product) variant is not implemented"
+    if beta.shape[1] != k.shape[1]:
+        return "CuTeDSL GDP: beta must be on the delta-product timeline"
+    if cu_seqlens is None:
+        return "CuTeDSL GDP: fixed-length batches are not implemented; pass cu_seqlens"
+
+    meta = _chunk_meta(cu_seqlens, num_householder, chunk_size)
+    if not meta["divisible"]:
+        return f"CuTeDSL GDP: sequence lengths must be multiples of the kernel chunk size ({chunk_size})"
+    if initial_state is not None and initial_state.shape[0] != meta["N"]:
+        return (
+            f"CuTeDSL GDP: initial_state has {initial_state.shape[0]} rows but "
+            f"cu_seqlens describes {meta['N']} sequences"
+        )
+    return None
 
 
 def _get_workspace(key: tuple, *shape_args, stream: cuda.CUstream) -> dict:
