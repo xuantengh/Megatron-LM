@@ -26,6 +26,8 @@ cumsum on both timelines, and the optional L2 normalization of ``q`` / ``k``.
 See :mod:`._gdp_preprocess`.
 """
 
+# pylint: disable=line-too-long
+
 import logging
 from typing import Type
 
@@ -136,7 +138,12 @@ def _chunk_meta(cu_seqlens: torch.Tensor, num_householder: int, chunk_size: int)
         "total_chunks": running,
         "divisible": divisible,
         "seq_lens": lens,
+        # Chunk-space offsets (first chunk index of each sequence).
         "seq_chunk_start": torch.tensor(starts, dtype=torch.int32, device=device),
+        # Token-space offsets. This is what the kernel's mSeqStart wants: it uses
+        # the value directly as `tok_begin`, so it must be cu_seqlens, not the
+        # chunk offsets above. Conflating the two silently reads the wrong tokens.
+        "seq_start_tokens": cu_seqlens.to(torch.int32),
         "seq_n_chunks": torch.tensor(chunks_per_seq, dtype=torch.int32, device=device),
         "chunk_indices": prepare_chunk_indices(cu_seqlens, chunk_size),
         "chunk_indices_dp": prepare_chunk_indices(cu_seqlens * num_householder, chunk_size),
@@ -229,6 +236,9 @@ def _get_compiled(
     num_householder: int,
     has_initial: bool,
     output_final_state: bool,
+    num_tokens: int,
+    num_seqs: int,
+    num_heads: int,
     *tensor_descriptors,
     stream: cuda.CUstream,
 ):
@@ -253,6 +263,13 @@ def _get_compiled(
     if _MAX_ACTIVE_CLUSTERS is None:
         _MAX_ACTIVE_CLUSTERS = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
 
+    # The descriptors are built with no dynamic modes, so token count and
+    # sequence count are baked into the compiled kernel as static shapes. They
+    # MUST therefore be part of the cache key -- otherwise the first shape
+    # compiled gets silently reused for every later one, which shows up as
+    # multi-sequence batches producing wrong numbers while single-sequence ones
+    # pass. (Marking dynamic modes instead would let one compile serve all
+    # shapes; worth doing once the kernel is stable.)
     key = (
         io_dtype,
         chunk_size,
@@ -261,6 +278,9 @@ def _get_compiled(
         num_householder,
         has_initial,
         output_final_state,
+        num_tokens,
+        num_seqs,
+        num_heads,
     )
     compiled = _COMPILE_CACHE.get(key)
     if compiled is None:
@@ -358,20 +378,55 @@ def chunk_gated_delta_product_cutedsl(
         g, num_householder=M, chunk_size=chunk_size, cu_seqlens=cu_seqlens, meta=meta
     )
 
-    key = (
-        meta["N"],
-        H,
+    device = q.device
+    n_seq = meta["N"]
+    has_initial = initial_state is not None
+
+    out = torch.empty(B, T, H, V, device=device, dtype=io_dtype)
+    final_state = torch.zeros(n_seq, H, K, V, device=device, dtype=torch.float32)
+    # The kernel always takes an initial-state tensor so the compile type-checks;
+    # when has_initial is False it is never read.
+    init_state = (
+        initial_state.to(torch.float32)
+        if has_initial
+        else torch.zeros(n_seq, H, K, V, device=device, dtype=torch.float32)
+    )
+
+    # The kernel indexes (T, H, D) directly -- drop the packed batch dim, which
+    # cu_seqlens already forces to 1.
+    descriptors = [
+        _to_cute(q[0].contiguous(), []),
+        _to_cute(k[0].contiguous(), []),
+        _to_cute(v[0].contiguous(), []),
+        _to_cute(beta[0].to(torch.float32).contiguous(), []),
+        _to_cute(g_cumsum[0].contiguous(), []),
+        _to_cute(g_interleaved_cumsum[0].contiguous(), []),
+        _to_cute(out[0], []),
+        _to_cute(final_state, []),
+        _to_cute(init_state, []),
+        _to_cute(meta["seq_start_tokens"], []),
+        _to_cute(meta["seq_n_chunks"], []),
+    ]
+
+    # `scale` is a runtime argument of the kernel's __call__, so it has to appear
+    # in the compile-time argument list too -- cute.compile type-checks the full
+    # signature. Omitting it fails with CALL_MISSING_ARG naming `stream`, because
+    # the trailing arguments shift by one.
+    scale_arg = cutlass.Float32(scale)
+    compiled = _get_compiled(
+        cute_io_dtype,
+        chunk_size,
         K,
         V,
         M,
-        chunk_size,
-        io_dtype,
-        initial_state is not None,
+        has_initial,
         output_final_state,
+        T,
+        n_seq,
+        H,
+        *descriptors,
+        scale_arg,
+        stream=stream,
     )
-    ws = _get_workspace(key, stream=stream)  # noqa: F841 - consumed by the launch below
-
-    raise NotImplementedError(
-        "chunk_gated_delta_product_cutedsl: pack operands into workspace descriptors "
-        "and launch ws['compiled']"
-    )
+    compiled(*descriptors, scale_arg, stream)
+    return out, (final_state.to(io_dtype) if output_final_state else None)

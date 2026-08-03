@@ -141,7 +141,9 @@ class GDPKernel:
 
         @cute.struct
         class SharedStorage:
-            sState: cute.struct.Align[cute.struct.MemRange[acc, cute.cosize(self.sState_layout)], 1024]
+            sState: cute.struct.Align[
+                cute.struct.MemRange[acc, cute.cosize(self.sState_layout)], 1024
+            ]
             # Snapshot of sState at the token-chunk boundary. Stage 4 reads the
             # state as it was BEFORE this chunk's M sub-chunk updates -- that is
             # what FLA materializes as `h` (stored at `i_t % M == 0`, i.e. at the
@@ -161,7 +163,9 @@ class GDPKernel:
             sAi: cute.struct.Align[cute.struct.MemRange[acc, cute.cosize(self.sA_layout)], 1024]
             sGt: cute.struct.Align[cute.struct.MemRange[gate, cute.cosize(self.sGt_layout)], 128]
             sGd: cute.struct.Align[cute.struct.MemRange[gate, cute.cosize(self.sGd_layout)], 128]
-            sBeta: cute.struct.Align[cute.struct.MemRange[gate, cute.cosize(self.sBeta_layout)], 128]
+            sBeta: cute.struct.Align[
+                cute.struct.MemRange[gate, cute.cosize(self.sBeta_layout)], 128
+            ]
 
         self.shared_storage = SharedStorage
         # `@cute.struct` exposes its own byte size; cute.size_in_bytes() is for
@@ -256,11 +260,7 @@ class GDPKernel:
             self.sGt_layout,
             self.sGd_layout,
             self.sBeta_layout,
-        ).launch(
-            grid=grid,
-            block=[self.num_threads, 1, 1],
-            stream=stream,
-        )
+        ).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
 
     # ------------------------------------------------------------------
     # Device body
@@ -352,8 +352,23 @@ class GDPKernel:
 
                 # --- Stage 4, once per token-chunk --------------------------
                 self._stage_c_readout(
-                    mO, mQ, mK, sQ, sVnew, sH, sGt, tiled_mma, scale,
-                    tok0, tok_begin, head_idx, tidx, L, DK, DV, M,
+                    mO,
+                    mQ,
+                    mK,
+                    sQ,
+                    sVnew,
+                    sH,
+                    sGt,
+                    tiled_mma,
+                    scale,
+                    tok0,
+                    tok_begin,
+                    head_idx,
+                    tidx,
+                    L,
+                    DK,
+                    DV,
+                    M,
                 )
                 cute.arch.barrier()
 
@@ -367,6 +382,14 @@ class GDPKernel:
     # ------------------------------------------------------------------
     # Stage helpers. Split out so each can be unit-tested against the torch
     # reference in isolation during bring-up.
+    #
+    # NOTE: the reduction loops below use `cutlass.range(..., unroll=1)`, NOT
+    # `range_constexpr`. constexpr loops are fully unrolled, and the readout's
+    # M x L x DK nest is 3*64*128 = 24576 bodies at the real head dims -- enough
+    # MLIR to make `cute.compile` itself abort (a hard crash inside
+    # base_dsl/compiler.py, not a launch failure). It survived only because the
+    # first bring-up used DK=32. Keep these dynamic; only the M loop, which is 3,
+    # stays constexpr.
     # ------------------------------------------------------------------
     @cute.jit
     def _init_state(self, sState, mInitialState, seq_idx, head_idx, tidx, DK, DV):
@@ -418,7 +441,7 @@ class GDPKernel:
             r, c = i // L, i % L
             acc = Float32(0.0)
             if r > c:
-                for d in cutlass.range_constexpr(DK):
+                for d in cutlass.range(DK, unroll=1):
                     acc += sK[r, d].to(Float32) * sK[c, d].to(Float32)
                 acc *= cute.arch.exp2(sGd[base + r] - sGd[base + c]) * sBeta[base + r]
             sA[r, c] = acc
@@ -435,7 +458,7 @@ class GDPKernel:
         for r in cutlass.range(1, L, 1, unroll=1):
             if tidx < L:
                 acc = Float32(0.0)
-                for j in cutlass.range_constexpr(L):
+                for j in cutlass.range(L, unroll=1):
                     if j < r:
                         acc -= sA[r, j] * sAi[j, tidx].to(Float32)
                 if tidx == r:
@@ -453,7 +476,7 @@ class GDPKernel:
         for i in cutlass.range(tidx, L * DK, self.num_threads, unroll=1):
             r, c = i // DK, i % DK
             acc = Float32(0.0)
-            for j in cutlass.range_constexpr(L):
+            for j in cutlass.range(L, unroll=1):
                 if j <= r:
                     kb = sK[j, c].to(Float32) * sBeta[base + j] * cute.arch.exp2(sGd[base + j])
                     acc += sAi[r, j].to(Float32) * kb
@@ -464,11 +487,11 @@ class GDPKernel:
         for i in cutlass.range(tidx, L * DV, self.num_threads, unroll=1):
             r, c = i // DV, i % DV
             u = Float32(0.0)
-            for j in cutlass.range_constexpr(L):
+            for j in cutlass.range(L, unroll=1):
                 if j <= r:
                     u += sAi[r, j].to(Float32) * (sV[j, c].to(Float32) * sBeta[base + j])
             ws = Float32(0.0)
-            for d in cutlass.range_constexpr(DK):
+            for d in cutlass.range(DK, unroll=1):
                 ws += sW[r, d].to(Float32) * sState[d, c]
             sVnew[base + r, c] = (u - ws).to(sVnew.element_type)
         cute.arch.barrier()
@@ -478,15 +501,31 @@ class GDPKernel:
         for i in cutlass.range(tidx, DK * DV, self.num_threads, unroll=1):
             r, c = i // DV, i % DV
             acc = sState[r, c] * cute.arch.exp2(gd_last)
-            for j in cutlass.range_constexpr(L):
+            for j in cutlass.range(L, unroll=1):
                 vg = sVnew[base + j, c].to(Float32) * cute.arch.exp2(gd_last - sGd[base + j])
                 acc += sK[j, r].to(Float32) * vg
             sState[r, c] = acc
 
     @cute.jit
     def _stage_c_readout(
-        self, mO, mQ, mK, sQ, sVnew, sH, sGt, tiled_mma, scale,
-        tok0, tok_begin, head_idx, tidx, L, DK, DV, M,
+        self,
+        mO,
+        mQ,
+        mK,
+        sQ,
+        sVnew,
+        sH,
+        sGt,
+        tiled_mma,
+        scale,
+        tok0,
+        tok_begin,
+        head_idx,
+        tidx,
+        L,
+        DK,
+        DV,
+        M,
     ):
         """``o = (Q @ h) * 2^gt + sum_m [tril(Q @ K_m^T) * decay] @ v_new_m``.
 
@@ -503,20 +542,20 @@ class GDPKernel:
             r, c = i // DV, i % DV
             # Inter-chunk: q @ h, decayed to this token.
             acc = Float32(0.0)
-            for d in cutlass.range_constexpr(DK):
+            for d in cutlass.range(DK, unroll=1):
                 acc += sQ[r, d].to(Float32) * sH[d, c]
             acc *= cute.arch.exp2(sGt[r])
             # Intra-chunk: M separate causal products, each against the m-th
             # sub-step of every token (stride M, NOT the m-th sub-chunk).
             for m in cutlass.range_constexpr(M):
-                for j in cutlass.range_constexpr(L):
+                for j in cutlass.range(L, unroll=1):
                     if j <= r:
                         qk = Float32(0.0)
-                        for d in cutlass.range_constexpr(DK):
+                        for d in cutlass.range(DK, unroll=1):
                             qk += sQ[r, d].to(Float32) * mK[(tok0 + j) * M + m, head_idx, d].to(
                                 Float32
                             )
-                        acc += qk * cute.arch.exp2(sGt[r] - sGt[j]) * sVnew[j * M + m, c].to(
-                            Float32
+                        acc += (
+                            qk * cute.arch.exp2(sGt[r] - sGt[j]) * sVnew[j * M + m, c].to(Float32)
                         )
             mO[tok0 + r, head_idx, c] = (acc * scale).to(mO.element_type)

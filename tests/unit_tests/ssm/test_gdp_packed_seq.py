@@ -15,6 +15,7 @@ Run with::
     torchrun --nproc_per_node=2 -m pytest \\
         tests/unit_tests/ssm/test_gdp_packed_seq.py -m internal -v
 """
+
 from __future__ import annotations
 
 import os
@@ -313,3 +314,130 @@ class TestGDPPackedSequence:
             + "\n".join(f"  {n} {s}: {m}" for n, s, m in mismatches)
         )
         assert n_compared > 0, "no parameters received a gradient — test setup is wrong"
+
+
+try:
+    from megatron.core.ssm.ops.cutedsl_gdp import (
+        HAVE_CUTEDSL_GDP,
+        chunk_gated_delta_product_cutedsl,
+        cutedsl_gdp_unsupported_reason,
+    )
+except ImportError:
+    HAVE_CUTEDSL_GDP = False
+
+# Every length is a multiple of the 64-token kernel chunk size. Ragged lengths
+# are rejected by cutedsl_gdp_unsupported_reason and fall back to FLA, which
+# ``test_cutedsl_rejects_ragged_lengths`` pins down separately.
+CUTEDSL_PACK_SHAPES = [
+    pytest.param([64], id="single-chunk"),
+    pytest.param([128], id="single-seq-two-chunks"),
+    pytest.param([64, 128], id="two-seqs-unequal"),
+    pytest.param([128, 64, 64], id="three-seqs-unequal"),
+    pytest.param([64, 64, 192], id="tail-heavy"),
+]
+
+
+def _make_gdp_kernel_inputs(seq_lens, num_heads=2, head_dim_k=128, head_dim_v=64, seed=1234):
+    """Build packed-THD operands in the layout both GDP backends expect.
+
+    ``q``/``g`` live on the token timeline and ``k``/``v``/``beta`` on the
+    delta-product timeline (``M`` sub-steps per token). ``q``/``k`` are
+    L2-normalized up front: the mixer always sets ``use_qk_l2norm_in_kernel``,
+    and the CuTe kernel's triangular inverse depends on it for conditioning.
+
+    Head dims default to GDP's own config defaults -- ``mamba_state_dim=128``
+    (``K``) and ``mamba_head_dim=64`` (``V``). They are asymmetric, and they are
+    also the only pair the dispatch guard currently accepts, so smaller values
+    make every case skip instead of run.
+    """
+    torch.manual_seed(seed)
+    m = 3  # GatedDeltaProductMixer hardcodes num_householder = 3
+    total = int(sum(seq_lens))
+    dev, dt = "cuda", torch.bfloat16
+
+    q = torch.randn(1, total, num_heads, head_dim_k, device=dev, dtype=dt)
+    k = torch.randn(1, total * m, num_heads, head_dim_k, device=dev, dtype=dt)
+    q = (q.float() / q.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(dt)
+    k = (k.float() / k.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(dt)
+    v = torch.randn(1, total * m, num_heads, head_dim_v, device=dev, dtype=dt)
+    beta = torch.rand(1, total * m, num_heads, device=dev, dtype=dt).sigmoid()
+    # Gate is a log-space decay: negative, and bounded so 2^cumsum cannot underflow.
+    g = -torch.rand(1, total, num_heads, device=dev, dtype=torch.float32) * 0.5
+    cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()), dtype=torch.int64, device=dev
+    )
+    return {"q": q, "k": k, "v": v, "g": g, "beta": beta, "cu_seqlens": cu, "m": m}
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(not HAVE_FLA, reason="requires fla")
+@pytest.mark.skipif(not HAVE_CUTEDSL_GDP, reason="requires the CuTe DSL runtime")
+class TestGDPCuteDSLvsFLA:
+    """The fused CuTe DSL GDP kernel must match FLA's Triton pipeline."""
+
+    @pytest.mark.parametrize("seq_lens", CUTEDSL_PACK_SHAPES)
+    def test_matches_fla_on_packed_thd(self, seq_lens):
+        """Both backends, identical THD operands, unequal sequence lengths."""
+        from fla.ops.gated_delta_product import chunk_gated_delta_product
+
+        x = _make_gdp_kernel_inputs(seq_lens)
+        m, cu = x["m"], x["cu_seqlens"]
+
+        reason = cutedsl_gdp_unsupported_reason(
+            x["q"], x["k"], x["v"], x["g"], x["beta"], m, cu_seqlens=cu
+        )
+        if reason is not None:
+            pytest.skip(f"batch not supported by the CuTe DSL backend: {reason}")
+
+        fla_out, _ = chunk_gated_delta_product(
+            x["q"],
+            x["k"],
+            x["v"],
+            g=x["g"],
+            beta=x["beta"],
+            num_householder=m,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu,
+        )
+        cute_out, _ = chunk_gated_delta_product_cutedsl(
+            x["q"],
+            x["k"],
+            x["v"],
+            x["g"],
+            x["beta"],
+            m,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu,
+        )
+
+        assert torch.isfinite(
+            cute_out
+        ).all(), (
+            f"{(~torch.isfinite(cute_out)).sum().item()} non-finite outputs from the CuTe kernel"
+        )
+        assert cute_out.shape == fla_out.shape
+
+        # Both kernels emit bf16 and chunk the recurrence differently, so they
+        # agree to a couple of bf16 ULPs rather than bitwise. atol is set from
+        # the tensor scale (1 ULP at |x| is |x|/256 for bf16) with headroom;
+        # rtol is deliberately loose because near-zero outputs make elementwise
+        # relative error meaningless here -- a real divergence shows up as O(1)
+        # in atol, not as a few percent in rtol.
+        scale = fla_out.float().abs().max().item()
+        torch.testing.assert_close(
+            cute_out.float(), fla_out.float(), atol=max(8.0 * scale / 256.0, 1e-4), rtol=0.5
+        )
+
+    def test_cutedsl_rejects_ragged_lengths(self):
+        """Lengths that are not multiples of the chunk size must fall back to FLA.
+
+        The kernel walks whole chunks and has no partial-tail predication yet, so
+        the guard must reject rather than silently compute garbage.
+        """
+        x = _make_gdp_kernel_inputs([100, 37])
+        reason = cutedsl_gdp_unsupported_reason(
+            x["q"], x["k"], x["v"], x["g"], x["beta"], x["m"], cu_seqlens=x["cu_seqlens"]
+        )
+        assert reason is not None
+        assert "multiples of the kernel chunk size" in reason
