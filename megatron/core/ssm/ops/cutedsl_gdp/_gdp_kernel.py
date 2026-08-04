@@ -126,6 +126,8 @@ class GDPKernel:
         self.sQ_layout = cute.make_ordered_layout((L, DK), order=(1, 0))
         # A / Ai are L x L on the delta-product timeline.
         self.sA_layout = cute.make_ordered_layout((L, L), order=(1, 0))
+        # Partial-output accumulator, [L, DV] fp32.
+
         # w is L x DK, u/v_new are L x DV. v_new must persist for ALL M sub-chunks
         # because the readout gathers it with stride M, so it is sized L * M.
         self.sW_layout = cute.make_ordered_layout((L, DK), order=(1, 0))
@@ -148,12 +150,26 @@ class GDPKernel:
             # state as it was BEFORE this chunk's M sub-chunk updates -- that is
             # what FLA materializes as `h` (stored at `i_t % M == 0`, i.e. at the
             # top of the sub-chunk loop, before the state advances).
+            #
+            # This can be eliminated by computing the inter-chunk readout term
+            # before the state pass (measured: 181.9 -> 165.9 KB, a 16 KB net
+            # win after the [L, DV] accumulator it needs). Reverted for now:
+            # it did not move `Block Limit Shared Mem` off 1 block/SM (that needs
+            # ~113 KB) and made no difference to runtime, so it was complexity
+            # without a payoff. Revisit together with moving sState to TMEM.
             sH: cute.struct.Align[cute.struct.MemRange[acc, cute.cosize(self.sState_layout)], 1024]
             sVnew: cute.struct.Align[cute.struct.MemRange[io, cute.cosize(self.sVnew_layout)], 1024]
             sK: cute.struct.Align[cute.struct.MemRange[io, cute.cosize(self.sK_layout)], 1024]
             sV: cute.struct.Align[cute.struct.MemRange[io, cute.cosize(self.sV_layout)], 1024]
             sQ: cute.struct.Align[cute.struct.MemRange[io, cute.cosize(self.sQ_layout)], 1024]
             sW: cute.struct.Align[cute.struct.MemRange[io, cute.cosize(self.sW_layout)], 1024]
+            # NOTE: sQ (stage 4 only) and sA (stage 1 only) have disjoint
+            # lifetimes and could share storage for another ~16 KB. Not done:
+            # sA is fp32 and sQ is io_dtype, `cute.struct` has no Union, and
+            # `MemRange.get_tensor` returns the MemRange's own dtype -- so the
+            # alias needs a pointer reinterpret rather than a second view. Left
+            # until the tcgen05 rework, which moves sState to TMEM and changes
+            # the budget anyway.
             sA: cute.struct.Align[cute.struct.MemRange[acc, cute.cosize(self.sA_layout)], 1024]
             # fp32, NOT io_dtype. This is a monolithic L-row forward substitution
             # and the entries of (I+A)^-1 grow with row index; in bf16 the lower
@@ -352,23 +368,7 @@ class GDPKernel:
 
                 # --- Stage 4, once per token-chunk --------------------------
                 self._stage_c_readout(
-                    mO,
-                    mQ,
-                    mK,
-                    sQ,
-                    sVnew,
-                    sH,
-                    sGt,
-                    tiled_mma,
-                    scale,
-                    tok0,
-                    tok_begin,
-                    head_idx,
-                    tidx,
-                    L,
-                    DK,
-                    DV,
-                    M,
+                    mO, mQ, mK, sQ, sVnew, sH, sGt, scale, tok0, head_idx, tidx, L, DK, DV, M
                 )
                 cute.arch.barrier()
 
@@ -508,30 +508,17 @@ class GDPKernel:
 
     @cute.jit
     def _stage_c_readout(
-        self,
-        mO,
-        mQ,
-        mK,
-        sQ,
-        sVnew,
-        sH,
-        sGt,
-        tiled_mma,
-        scale,
-        tok0,
-        tok_begin,
-        head_idx,
-        tidx,
-        L,
-        DK,
-        DV,
-        M,
+        self, mO, mQ, mK, sQ, sVnew, sH, sGt, scale, tok0, head_idx, tidx, L, DK, DV, M
     ):
         """``o = (Q @ h) * 2^gt + sum_m [tril(Q @ K_m^T) * decay] @ v_new_m``.
 
         ``sH`` is the snapshot of the state taken at the *start* of this
         token-chunk, not the live ``sState`` (which the M sub-chunks have already
         advanced). This mirrors FLA storing ``h`` at ``i_t % M == 0``.
+
+        The ``m`` loop is over householder sub-steps and gathers with stride
+        ``M`` -- these M terms are an independent sum, unlike the state
+        recurrence, which is strictly sequential in ``m``.
         """
         for i in cutlass.range(tidx, L * DK, self.num_threads, unroll=1):
             r, c = i // DK, i % DK
@@ -545,8 +532,8 @@ class GDPKernel:
             for d in cutlass.range(DK, unroll=1):
                 acc += sQ[r, d].to(Float32) * sH[d, c]
             acc *= cute.arch.exp2(sGt[r])
-            # Intra-chunk: M separate causal products, each against the m-th
-            # sub-step of every token (stride M, NOT the m-th sub-chunk).
+            # Intra-chunk: M causal products, each against the m-th sub-step of
+            # every token (stride M, NOT the m-th sub-chunk).
             for m in cutlass.range_constexpr(M):
                 for j in cutlass.range(L, unroll=1):
                     if j <= r:

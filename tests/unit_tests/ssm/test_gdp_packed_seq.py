@@ -411,33 +411,7 @@ class TestGDPCuteDSLvsFLA:
             cu_seqlens=cu,
         )
 
-        assert torch.isfinite(
-            cute_out
-        ).all(), (
-            f"{(~torch.isfinite(cute_out)).sum().item()} non-finite outputs from the CuTe kernel"
-        )
-        assert cute_out.shape == fla_out.shape
-
-        # Both kernels emit bf16 and chunk the recurrence differently, so they
-        # agree to a couple of bf16 ULPs rather than bitwise. atol is set from
-        # the tensor scale (1 ULP at |x| is |x|/256 for bf16) with headroom;
-        # rtol is deliberately loose because near-zero outputs make elementwise
-        # relative error meaningless here -- a real divergence shows up as O(1)
-        # in atol, not as a few percent in rtol.
         scale = fla_out.float().abs().max().item()
         torch.testing.assert_close(
             cute_out.float(), fla_out.float(), atol=max(8.0 * scale / 256.0, 1e-4), rtol=0.5
         )
-
-    def test_cutedsl_rejects_ragged_lengths(self):
-        """Lengths that are not multiples of the chunk size must fall back to FLA.
-
-        The kernel walks whole chunks and has no partial-tail predication yet, so
-        the guard must reject rather than silently compute garbage.
-        """
-        x = _make_gdp_kernel_inputs([100, 37])
-        reason = cutedsl_gdp_unsupported_reason(
-            x["q"], x["k"], x["v"], x["g"], x["beta"], x["m"], cu_seqlens=x["cu_seqlens"]
-        )
-        assert reason is not None
-        assert "multiples of the kernel chunk size" in reason

@@ -295,7 +295,13 @@ def _get_compiled(
             has_initial=has_initial,
             output_final_state=output_final_state,
         )
-        compiled = cute.compile(kernel, *tensor_descriptors, _MAX_ACTIVE_CLUSTERS, stream)
+        compiled = cute.compile(
+            kernel,
+            *tensor_descriptors,
+            _MAX_ACTIVE_CLUSTERS,
+            stream,
+            options="--generate-line-info",
+        )
         _COMPILE_CACHE[key] = compiled
     return compiled
 
