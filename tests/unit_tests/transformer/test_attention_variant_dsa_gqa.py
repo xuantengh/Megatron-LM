@@ -5,8 +5,21 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
 
+from megatron.core.extensions.transformer_engine import (
+    TEDotProductAttention,
+    TELayerNormColumnParallelLinear,
+    TERowParallelLinear,
+)
+from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
@@ -50,6 +63,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_topk_index_block,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 class _DummyTPGroup:
@@ -3441,3 +3455,147 @@ def test_fused_qk_topk_chunked_matches_dense_reference():
         torch.sort(chunked_scores, dim=-1).values,
         torch.sort(dense_scores.gather(-1, dense_indices), dim=-1).values,
     )
+
+
+def _build_dsa_gqa_dynamic_packed_seq_params(
+    inference_context: DynamicInferenceContext,
+) -> PackedSeqParams:
+    """Build packed-sequence metadata from the dynamic inference context."""
+    active_request_count = inference_context.get_active_request_count()
+    cu_seqlens_q, max_seqlen_q = inference_context.cu_query_lengths()
+    cu_seqlens_kv, _, max_seqlen_kv = inference_context.cu_kv_lengths()
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q[: active_request_count + 1],
+        cu_seqlens_kv=cu_seqlens_kv[: active_request_count + 1],
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        total_tokens=inference_context.active_token_count,
+    )
+
+
+class TestDSGQAInference:
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "provide_packed_seq_params",
+        [True, False],
+        ids=["packed-sequence-metadata", "missing-packed-sequence-metadata"],
+    )
+    def test_dsa_gqa_dynamic_inference(self, provide_packed_seq_params):
+        dtype = torch.bfloat16
+        hidden_size = 4096
+        num_attention_heads = 32
+        num_query_groups = 1
+        head_dim = 192
+        prompt_lengths = (8, 5, 3)
+
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            ffn_hidden_size=21376,
+            num_attention_heads=num_attention_heads,
+            num_query_groups=num_query_groups,
+            kv_channels=head_dim,
+            params_dtype=dtype,
+            bf16=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=1.0e-5,
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_simplified_use_learned_k=False,
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=head_dim,
+            dsa_indexer_topk=512,
+            tensor_model_parallel_size=1,
+            sequence_parallel=False,
+        )
+        inference_context = DynamicInferenceContext(
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=131072,
+                max_requests=4,
+                max_tokens=128,
+                block_size_tokens=256,
+                buffer_size_gb=0.05,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+        token_offset = 0
+        for request_id, prompt_length in enumerate(prompt_lengths):
+            inference_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        token_offset, token_offset + prompt_length, dtype=torch.long, device="cpu"
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1),
+                )
+            )
+            token_offset += prompt_length
+        inference_context.initialize_attention_state()
+        assert inference_context.total_request_count == len(prompt_lengths)
+        assert inference_context.active_token_count == sum(prompt_lengths)
+
+        attention = DSGroupedSelfAttention(
+            config=transformer_config,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                core_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
+            ),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.eval()
+        hidden_states = torch.randn(
+            inference_context.padded_active_token_count,
+            1,
+            hidden_size,
+            dtype=dtype,
+            device=torch.cuda.current_device(),
+        )
+
+        packed_seq_params = (
+            _build_dsa_gqa_dynamic_packed_seq_params(inference_context)
+            if provide_packed_seq_params
+            else None
+        )
+        if not provide_packed_seq_params:
+            with (
+                torch.inference_mode(),
+                InferenceMode.active(),
+                pytest.raises(
+                    NotImplementedError,
+                    match="Dynamic inference requires packed sequence parameters",
+                ),
+            ):
+                attention(
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                )
+            return
+
+        with torch.inference_mode(), InferenceMode.active():
+            output, bias = attention(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+
+        assert bias is None
+        assert output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
+        assert output.dtype == dtype

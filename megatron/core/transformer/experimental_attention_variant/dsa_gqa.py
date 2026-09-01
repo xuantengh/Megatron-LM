@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -53,32 +54,87 @@ def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_
     return key, value
 
 
-def _gather_block_cache_sequence(
-    cache: torch.Tensor, block_table_row: torch.Tensor, sequence_length: int, block_size_tokens: int
-) -> torch.Tensor:
-    """Materialize a per-request sequence from a paged block cache."""
-    if sequence_length == 0:
-        return cache.new_empty((0,) + cache.shape[2:])
-    positions = torch.arange(sequence_length, device=cache.device, dtype=torch.long)
-    block_ids = block_table_row[(positions // block_size_tokens).to(block_table_row.device)].long()
-    local_positions = positions % block_size_tokens
-    return cache[block_ids, local_positions]
+def _cumulative_sequence_lengths(sequence_lengths: torch.Tensor) -> torch.Tensor:
+    """Build int64 jagged offsets from per-request sequence lengths."""
+    offsets = torch.zeros(
+        sequence_lengths.numel() + 1, dtype=torch.long, device=sequence_lengths.device
+    )
+    torch.cumsum(sequence_lengths.to(torch.long), dim=0, out=offsets[1:])
+    return offsets
 
 
-def _build_shifted_causal_mask(
-    query_length: int, key_length: int, query_start_position: int, device: torch.device
+def _packed_paged_cache_indices(
+    block_table: torch.Tensor, sequence_lengths: torch.Tensor, block_size_tokens: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map every token in a variable-length batch to its physical paged-cache slot."""
+    sequence_lengths = sequence_lengths.to(device=block_table.device, dtype=torch.long)
+    offsets = _cumulative_sequence_lengths(sequence_lengths)
+    total_tokens = int(offsets[-1].item())
+    request_indices = torch.repeat_interleave(
+        torch.arange(sequence_lengths.numel(), device=block_table.device),
+        sequence_lengths,
+        output_size=total_tokens,
+    )
+    positions = torch.arange(total_tokens, device=block_table.device) - offsets[request_indices]
+    physical_blocks = block_table[request_indices, positions // block_size_tokens].long()
+    return physical_blocks, positions % block_size_tokens, offsets, request_indices
+
+
+def _jagged_to_padded(
+    packed: torch.Tensor, offsets: torch.Tensor, max_sequence_length: int
 ) -> torch.Tensor:
-    """Build a causal mask for a query chunk that starts at a non-zero KV offset."""
-    if query_length == 0 or key_length == 0:
-        return torch.empty((query_length, key_length), dtype=torch.float32, device=device)
-    query_positions = torch.arange(
-        query_start_position, query_start_position + query_length, device=device, dtype=torch.long
+    """Convert a packed jagged tensor to a dense batch through NestedTensor."""
+    nested = torch.nested.nested_tensor_from_jagged(
+        packed, offsets=offsets, max_seqlen=max_sequence_length
     )
-    key_positions = torch.arange(key_length, device=device, dtype=torch.long)
-    invalid = key_positions.view(1, key_length) > query_positions.view(query_length, 1)
-    return torch.zeros((query_length, key_length), dtype=torch.float32, device=device).masked_fill(
-        invalid, float("-inf")
+    return nested.to_padded_tensor(0.0)
+
+
+def _simplified_qk_topk_batched_nested(
+    q_index: torch.Tensor,
+    index_key: torch.Tensor,
+    query_lengths: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    request_kv_offsets: torch.Tensor,
+    query_offsets: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute causal simplified-indexer top-k for all dynamic requests in one padded batch."""
+    max_query_length = int(query_lengths.max().item())
+    max_kv_length = int(kv_lengths.max().item())
+    q_padded = _jagged_to_padded(q_index.float(), query_offsets, max_query_length)
+    k_padded = _jagged_to_padded(index_key.float(), kv_offsets, max_kv_length)
+    scores = torch.bmm(q_padded, k_padded.transpose(1, 2)) * softmax_scale
+
+    query_positions = torch.arange(max_query_length, device=scores.device)
+    key_positions = torch.arange(max_kv_length, device=scores.device)
+    real_queries = query_positions.unsqueeze(0) < query_lengths.unsqueeze(1)
+    real_keys = key_positions.unsqueeze(0) < kv_lengths.unsqueeze(1)
+    causal = key_positions.view(1, 1, -1) <= (
+        request_kv_offsets.view(-1, 1, 1) + query_positions.view(1, -1, 1)
     )
+    valid = real_queries.unsqueeze(2) & real_keys.unsqueeze(1) & causal
+    # Give padded query rows one harmless key so their softmax stays finite. They are removed
+    # when the padded output is converted back to the dynamic packed-token layout.
+    valid = valid | ((~real_queries).unsqueeze(2) & (key_positions.view(1, 1, -1) == 0))
+    attention_mask = torch.zeros_like(scores, dtype=torch.float32).masked_fill(
+        ~valid, float("-inf")
+    )
+    scores = scores + attention_mask
+
+    selected_width = min(topk, max_kv_length)
+    topk_indices = scores.topk(selected_width, dim=-1).indices
+    valid_counts = torch.minimum(
+        kv_lengths.view(-1, 1), request_kv_offsets.view(-1, 1) + query_positions.view(1, -1) + 1
+    ).clamp(max=selected_width)
+    valid_counts = torch.where(real_queries, valid_counts, torch.ones_like(valid_counts))
+    valid_topk = torch.arange(selected_width, device=scores.device).view(1, 1, -1) < (
+        valid_counts.unsqueeze(2)
+    )
+    topk_indices = topk_indices.masked_fill(~valid_topk, -1)
+    return topk_indices, attention_mask
 
 
 @dataclass(frozen=True)
@@ -842,6 +898,8 @@ def _simplified_qk_topk_chunked(
 class DSGQACoreAttention(MegatronModule):
     """Token-level DSA core attention for grouped-query attention."""
 
+    indexer: SimplifiedDSGQAIndexer
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1142,7 +1200,8 @@ class DSGQACoreAttention(MegatronModule):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         hidden_states: torch.Tensor,
-        inference_context,
+        inference_context: DynamicInferenceContext,
+        packed_seq_params: PackedSeqParams,
         provider_layer_number: int,
         block_table: torch.Tensor,
         use_indexer_rope: bool = False,
@@ -1158,127 +1217,124 @@ class DSGQACoreAttention(MegatronModule):
                 "Dynamic DSA-GQA currently supports simplified indexers only."
             )
 
+        if query.dim() == 3:
+            # Attention removes the dummy batch dimension for THD inputs before dispatching to
+            # core attention. Dynamic inference still uses a flattened token layout internally.
+            query = query.unsqueeze(1)
+        elif query.dim() != 4:
+            raise ValueError(
+                f"DSA-GQA dynamic inference expected a 3-D THD or 4-D query, got {query.shape}."
+            )
+        sq, batch_size, num_query_heads, _ = query.size()
+        assert batch_size == 1, "Dynamic DSA-GQA expects a flattened token layout with batch=1."
+        value_head_dim = value_cache.size(-1)
+        output = value_cache.new_zeros((sq, batch_size, num_query_heads * value_head_dim))
+        active_request_count = (
+            inference_context.total_request_count - inference_context.paused_request_count
+        )
+        if active_request_count == 0:
+            return output
+
         simplified_learned_k = getattr(self.config, "dsa_simplified_use_learned_k", False)
         if _simplified_indexer_uses_main_input_norm(self.config):
             hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
+        main_block_table = block_table[:active_request_count]
         if simplified_learned_k:
             q_index, k_index_current = self.indexer.forward_qk_dynamic(
                 hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
             )
             inference_context.append_dsa_key_cache(provider_layer_number, k_index_current)
             dsa_key_cache, dsa_block_table = inference_context.dsa_key_cache(provider_layer_number)
-            block_table = dsa_block_table
         else:
             q_index = self.indexer.forward_q_dynamic(
                 hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
             )
             dsa_key_cache = None
+            dsa_block_table = None
 
         state_data = inference_context.active_attn_metadata["mha_metadata"].state_data
-        query_lengths = state_data["query_lengths"]
-        kv_lengths = state_data["kv_seq_lengths"]
-        kv_offsets = inference_context.request_kv_length_offsets[
-            inference_context.paused_request_count : inference_context.total_request_count
-        ]
+        query_lengths = state_data["query_lengths"][:active_request_count].to(torch.long)
+        kv_lengths = state_data["kv_seq_lengths"][:active_request_count].to(torch.long)
 
-        sq, batch_size, num_query_heads, _ = query.size()
-        value_head_dim = value_cache.size(-1)
-        output = value_cache.new_zeros((sq, batch_size, num_query_heads * value_head_dim))
-
-        query_cursor = 0
-        block_size_tokens = inference_context.block_size_tokens
-        for request_idx in range(inference_context.padded_active_request_count):
-            query_length = int(query_lengths[request_idx].item())
-            if query_length == 0:
-                continue
-
-            key_length = int(kv_lengths[request_idx].item())
-            query_start = query_cursor
-            query_end = query_start + query_length
-            query_cursor = query_end
-            if key_length == 0:
-                continue
-
-            block_table_row = block_table[request_idx]
-            request_key = _gather_block_cache_sequence(
-                key_cache, block_table_row, key_length, block_size_tokens
-            ).unsqueeze(1)
-            request_value = _gather_block_cache_sequence(
-                value_cache, block_table_row, key_length, block_size_tokens
-            ).unsqueeze(1)
-            if simplified_learned_k:
-                request_index_key = (
-                    _gather_block_cache_sequence(
-                        dsa_key_cache, block_table_row, key_length, block_size_tokens
-                    )
-                    .unsqueeze(1)
-                    .unsqueeze(2)
-                )
-            else:
-                request_index_key = request_key
-
-            request_query = query[query_start:query_end]
-            request_q_index = q_index[query_start:query_end]
-            request_offset = (
-                int(kv_offsets[request_idx].item()) if request_idx < kv_offsets.numel() else 0
-            )
-            request_mask = _build_shifted_causal_mask(
-                query_length, key_length, request_offset, request_query.device
-            )
-
-            key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
-            if key_chunk_size is None or key_chunk_size <= 0:
-                key_chunk_size = getattr(self.config, "dsa_kernel_key_block_size", None)
-            query_chunk_size = getattr(self.config, "dsa_kernel_query_block_size", None)
-            if query_chunk_size is None or query_chunk_size <= 0:
-                query_chunk_size = query_length
-            topk_chunks = []
-            for local_q_start in range(0, query_length, query_chunk_size):
-                local_q_end = min(local_q_start + query_chunk_size, query_length)
-                q_index_chunk = request_q_index[local_q_start:local_q_end]
-                mask_chunk = request_mask[local_q_start:local_q_end]
-                if key_chunk_size is not None and key_chunk_size > 0:
-                    _, topk_chunk = _simplified_qk_topk_chunked(
-                        q_index_chunk,
-                        request_index_key,
-                        self.indexer.index_topk,
-                        self.indexer.softmax_scale,
-                        mask_chunk,
-                        key_chunk_size,
-                    )
-                else:
-                    _, topk_chunk = _simplified_qk_topk_naive(
-                        q_index_chunk,
-                        request_index_key,
-                        self.indexer.index_topk,
-                        self.indexer.softmax_scale,
-                        mask_chunk,
-                    )
-                topk_chunks.append(topk_chunk)
-            topk_indices = torch.cat(topk_chunks, dim=1)
-
-            sparse_query_chunk_size = getattr(
-                self.config, "dsa_sparse_attention_query_chunk_size", None
-            )
-            if sparse_query_chunk_size is None or sparse_query_chunk_size <= 0:
-                sparse_query_chunk_size = getattr(self.config, "dsa_kernel_query_block_size", None)
-            request_output = unfused_grouped_dsa_fn(
-                request_query,
-                request_key,
-                request_value,
-                topk_indices,
-                self.softmax_scale,
-                mask=request_mask,
-                query_chunk_size=sparse_query_chunk_size,
-                use_gather=True,
-            )
-            output[query_start:query_end] = request_output
-
-        if query_cursor != inference_context.active_token_count:
+        cu_q_seqlens, _ = inference_context.cu_query_lengths()
+        cu_q_seqlens = cu_q_seqlens[: active_request_count + 1].to(torch.long)
+        total_query_tokens = int(cu_q_seqlens[-1].item())
+        if packed_seq_params.total_tokens != total_query_tokens:
             raise RuntimeError(
-                f"DSA-GQA dynamic inference consumed {query_cursor} query tokens but context has "
-                f"{inference_context.active_token_count} active tokens."
+                "DSA-GQA dynamic inference packed-sequence metadata has "
+                f"{packed_seq_params.total_tokens} query tokens, but the inference context has "
+                f"{total_query_tokens}."
             )
+        if total_query_tokens != inference_context.active_token_count:
+            raise RuntimeError(
+                f"DSA-GQA dynamic inference received {total_query_tokens} query tokens but "
+                f"context has {inference_context.active_token_count} active tokens."
+            )
+
+        block_size_tokens = inference_context.block_size_tokens
+        physical_blocks, local_positions, kv_offsets, _ = _packed_paged_cache_indices(
+            main_block_table, kv_lengths, block_size_tokens
+        )
+        key_packed = key_cache[physical_blocks, local_positions]
+        value_packed = value_cache[physical_blocks, local_positions]
+        if simplified_learned_k:
+            dsa_blocks, dsa_positions, dsa_offsets, _ = _packed_paged_cache_indices(
+                dsa_block_table[:active_request_count], kv_lengths, block_size_tokens
+            )
+            if not torch.equal(dsa_offsets, kv_offsets):
+                raise RuntimeError("Main and learned-indexer K caches have different lengths.")
+            index_key_packed = dsa_key_cache[dsa_blocks, dsa_positions]
+        else:
+            index_key_packed = key_packed[:, 0, :]
+
+        request_kv_offsets = inference_context.gpu_view.request_kv_length_offsets[
+            :active_request_count
+        ].to(torch.long)
+        topk_indices, attention_mask = _simplified_qk_topk_batched_nested(
+            q_index[:total_query_tokens, 0, 0, :],
+            index_key_packed,
+            query_lengths,
+            kv_lengths,
+            request_kv_offsets,
+            cu_q_seqlens,
+            kv_offsets,
+            self.indexer.index_topk,
+            self.indexer.softmax_scale,
+        )
+
+        max_query_length = int(query_lengths.max().item())
+        max_kv_length = int(kv_lengths.max().item())
+        query_padded = _jagged_to_padded(
+            query[:total_query_tokens, 0], cu_q_seqlens, max_query_length
+        ).permute(1, 0, 2, 3)
+        key_padded = _jagged_to_padded(key_packed, kv_offsets, max_kv_length).permute(1, 0, 2, 3)
+        value_padded = _jagged_to_padded(value_packed, kv_offsets, max_kv_length).permute(
+            1, 0, 2, 3
+        )
+        sparse_query_chunk_size = getattr(
+            self.config, "dsa_sparse_attention_query_chunk_size", None
+        )
+        padded_output = unfused_grouped_dsa_fn(
+            query_padded,
+            key_padded,
+            value_padded,
+            topk_indices,
+            self.softmax_scale,
+            mask=attention_mask,
+            query_chunk_size=sparse_query_chunk_size,
+            use_gather=True,
+        )
+
+        query_request_indices = torch.repeat_interleave(
+            torch.arange(active_request_count, device=query.device),
+            query_lengths,
+            output_size=total_query_tokens,
+        )
+        query_positions = (
+            torch.arange(total_query_tokens, device=query.device)
+            - cu_q_seqlens[query_request_indices]
+        )
+        output[:total_query_tokens, 0] = padded_output[query_positions, query_request_indices]
         if is_using_quantization_scales(self.config):
             output[inference_context.padding_slice] = 0.0
         return output
@@ -1670,10 +1726,8 @@ class DSGroupedSelfAttention(SelfAttention):
                 hidden_states=hidden_states,
                 use_indexer_rope=use_indexer_rope,
             )
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "Packed sequence is not supported for DSA-GQA dynamic inference."
-            )
+        if packed_seq_params is None:
+            raise NotImplementedError("Dynamic inference requires packed sequence parameters.")
         if inference_context.using_cuda_graph_this_step():
             raise NotImplementedError("DSA-GQA dynamic inference does not yet support CUDA graphs.")
 
@@ -1684,6 +1738,7 @@ class DSGroupedSelfAttention(SelfAttention):
             value_cache=value,
             hidden_states=hidden_states,
             inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
             provider_layer_number=provider_layer_number,
             block_table=block_table,
             use_indexer_rope=use_indexer_rope,
