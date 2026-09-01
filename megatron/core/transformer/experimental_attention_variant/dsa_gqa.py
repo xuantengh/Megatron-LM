@@ -35,6 +35,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_using_quantization_scales
 
+# pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring
+
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
     """Expand grouped keys/values to per-query-head layout for reference attention math."""
@@ -49,6 +51,34 @@ def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_
     key = key.repeat_interleave(repeat_factor, dim=2)
     value = value.repeat_interleave(repeat_factor, dim=2)
     return key, value
+
+
+def _gather_block_cache_sequence(
+    cache: torch.Tensor, block_table_row: torch.Tensor, sequence_length: int, block_size_tokens: int
+) -> torch.Tensor:
+    """Materialize a per-request sequence from a paged block cache."""
+    if sequence_length == 0:
+        return cache.new_empty((0,) + cache.shape[2:])
+    positions = torch.arange(sequence_length, device=cache.device, dtype=torch.long)
+    block_ids = block_table_row[(positions // block_size_tokens).to(block_table_row.device)].long()
+    local_positions = positions % block_size_tokens
+    return cache[block_ids, local_positions]
+
+
+def _build_shifted_causal_mask(
+    query_length: int, key_length: int, query_start_position: int, device: torch.device
+) -> torch.Tensor:
+    """Build a causal mask for a query chunk that starts at a non-zero KV offset."""
+    if query_length == 0 or key_length == 0:
+        return torch.empty((query_length, key_length), dtype=torch.float32, device=device)
+    query_positions = torch.arange(
+        query_start_position, query_start_position + query_length, device=device, dtype=torch.long
+    )
+    key_positions = torch.arange(key_length, device=device, dtype=torch.long)
+    invalid = key_positions.view(1, key_length) > query_positions.view(query_length, 1)
+    return torch.zeros((query_length, key_length), dtype=torch.float32, device=device).masked_fill(
+        invalid, float("-inf")
+    )
 
 
 @dataclass(frozen=True)
@@ -602,6 +632,87 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         )
         return torch.cat([q_nope, q_pe], dim=-1)
 
+    def _apply_rope_dynamic(self, q: torch.Tensor, inference_context):
+        if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
+            return q
+        n = inference_context.active_token_count
+        rotary_seq_len = (
+            1
+            if n == 0
+            else int(inference_context.token_to_position_in_request[:n].max().item()) + 1
+        )
+        if self.config.rope_type == "rope":
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+        q_nope, q_pe = torch.split(
+            q, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        )
+        q_pe = q_pe.clone()
+        if n > 0:
+            positions = inference_context.gpu_view.token_to_pos_ids[:n]
+            q_pe[:n] = apply_rotary_pos_emb(
+                q_pe[:n],
+                rotary_pos_emb[positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+        q = torch.cat([q_nope, q_pe], dim=-1)
+        if n < q.size(0):
+            q[n:] = 0
+        return q
+
+    def _apply_rope_dynamic_qk(
+        self, q: torch.Tensor, k: torch.Tensor, inference_context
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
+            return q, k
+        n = inference_context.active_token_count
+        rotary_seq_len = (
+            1
+            if n == 0
+            else int(inference_context.token_to_position_in_request[:n].max().item()) + 1
+        )
+        if self.config.rope_type == "rope":
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+        q_nope, q_pe = torch.split(
+            q, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        )
+        k_nope, k_pe = torch.split(
+            k, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        )
+        q_pe = q_pe.clone()
+        k_pe = k_pe.clone()
+        if n > 0:
+            q_positions = inference_context.gpu_view.token_to_pos_ids[:n]
+            k_positions = inference_context.gpu_view.token_to_position_in_request[:n]
+            q_pe[:n] = apply_rotary_pos_emb(
+                q_pe[:n],
+                rotary_pos_emb[q_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+            k_pe[:n] = apply_rotary_pos_emb(
+                k_pe[:n],
+                rotary_pos_emb[k_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+        q = torch.cat([q_nope, q_pe], dim=-1)
+        k = torch.cat([k_nope, k_pe], dim=-1)
+        if n < q.size(0):
+            q[n:] = 0
+            k[n:] = 0
+        return q, k
+
     def forward_q(
         self,
         hidden_states: torch.Tensor,
@@ -616,6 +727,10 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         q, _ = self.linear_q(hidden_states)
         q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
         return self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params)
+
+    def forward_q_dynamic(self, hidden_states: torch.Tensor, use_rope: bool, inference_context):
+        q = self.forward_q(hidden_states, use_rope=False)
+        return self._apply_rope_dynamic(q, inference_context) if use_rope else q
 
     def forward_qk(
         self,
@@ -638,6 +753,20 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params),
             self._apply_rope(k, use_rope=use_rope, packed_seq_params=packed_seq_params),
         )
+
+    def forward_qk_dynamic(self, hidden_states: torch.Tensor, use_rope: bool, inference_context):
+        if not self.use_learned_k or self.linear_k is None:
+            raise RuntimeError("Simplified DSA learned-K projection is not enabled.")
+        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+        seqlen, batch_size, _ = hidden_states.shape
+        q, _ = self.linear_q(hidden_states)
+        k, _ = self.linear_k(hidden_states)
+        q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        return self._apply_rope_dynamic_qk(q, k, inference_context) if use_rope else (q, k)
 
 
 class _DSAZeroParamDependency(torch.autograd.Function):
@@ -1007,6 +1136,153 @@ class DSGQACoreAttention(MegatronModule):
             use_gather=sparse_attention_use_gather,
         )
 
+    def forward_dynamic(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inference_context,
+        provider_layer_number: int,
+        block_table: torch.Tensor,
+        use_indexer_rope: bool = False,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Run simplified DSA-GQA over the dynamic-inference paged cache."""
+        assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
+        assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
+        if getattr(self.config, "dsa_fwd_skip_dsa", False):
+            raise NotImplementedError("dsa_fwd_skip_dsa is not supported by dynamic inference.")
+        if getattr(self.config, "dsa_indexer_mode", "standard") != "simplified":
+            raise NotImplementedError(
+                "Dynamic DSA-GQA currently supports simplified indexers only."
+            )
+
+        simplified_learned_k = getattr(self.config, "dsa_simplified_use_learned_k", False)
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
+        if simplified_learned_k:
+            q_index, k_index_current = self.indexer.forward_qk_dynamic(
+                hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+            )
+            inference_context.append_dsa_key_cache(provider_layer_number, k_index_current)
+            dsa_key_cache, dsa_block_table = inference_context.dsa_key_cache(provider_layer_number)
+            block_table = dsa_block_table
+        else:
+            q_index = self.indexer.forward_q_dynamic(
+                hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+            )
+            dsa_key_cache = None
+
+        state_data = inference_context.active_attn_metadata["mha_metadata"].state_data
+        query_lengths = state_data["query_lengths"]
+        kv_lengths = state_data["kv_seq_lengths"]
+        kv_offsets = inference_context.request_kv_length_offsets[
+            inference_context.paused_request_count : inference_context.total_request_count
+        ]
+
+        sq, batch_size, num_query_heads, _ = query.size()
+        value_head_dim = value_cache.size(-1)
+        output = value_cache.new_zeros((sq, batch_size, num_query_heads * value_head_dim))
+
+        query_cursor = 0
+        block_size_tokens = inference_context.block_size_tokens
+        for request_idx in range(inference_context.padded_active_request_count):
+            query_length = int(query_lengths[request_idx].item())
+            if query_length == 0:
+                continue
+
+            key_length = int(kv_lengths[request_idx].item())
+            query_start = query_cursor
+            query_end = query_start + query_length
+            query_cursor = query_end
+            if key_length == 0:
+                continue
+
+            block_table_row = block_table[request_idx]
+            request_key = _gather_block_cache_sequence(
+                key_cache, block_table_row, key_length, block_size_tokens
+            ).unsqueeze(1)
+            request_value = _gather_block_cache_sequence(
+                value_cache, block_table_row, key_length, block_size_tokens
+            ).unsqueeze(1)
+            if simplified_learned_k:
+                request_index_key = (
+                    _gather_block_cache_sequence(
+                        dsa_key_cache, block_table_row, key_length, block_size_tokens
+                    )
+                    .unsqueeze(1)
+                    .unsqueeze(2)
+                )
+            else:
+                request_index_key = request_key
+
+            request_query = query[query_start:query_end]
+            request_q_index = q_index[query_start:query_end]
+            request_offset = (
+                int(kv_offsets[request_idx].item()) if request_idx < kv_offsets.numel() else 0
+            )
+            request_mask = _build_shifted_causal_mask(
+                query_length, key_length, request_offset, request_query.device
+            )
+
+            key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
+            if key_chunk_size is None or key_chunk_size <= 0:
+                key_chunk_size = getattr(self.config, "dsa_kernel_key_block_size", None)
+            query_chunk_size = getattr(self.config, "dsa_kernel_query_block_size", None)
+            if query_chunk_size is None or query_chunk_size <= 0:
+                query_chunk_size = query_length
+            topk_chunks = []
+            for local_q_start in range(0, query_length, query_chunk_size):
+                local_q_end = min(local_q_start + query_chunk_size, query_length)
+                q_index_chunk = request_q_index[local_q_start:local_q_end]
+                mask_chunk = request_mask[local_q_start:local_q_end]
+                if key_chunk_size is not None and key_chunk_size > 0:
+                    _, topk_chunk = _simplified_qk_topk_chunked(
+                        q_index_chunk,
+                        request_index_key,
+                        self.indexer.index_topk,
+                        self.indexer.softmax_scale,
+                        mask_chunk,
+                        key_chunk_size,
+                    )
+                else:
+                    _, topk_chunk = _simplified_qk_topk_naive(
+                        q_index_chunk,
+                        request_index_key,
+                        self.indexer.index_topk,
+                        self.indexer.softmax_scale,
+                        mask_chunk,
+                    )
+                topk_chunks.append(topk_chunk)
+            topk_indices = torch.cat(topk_chunks, dim=1)
+
+            sparse_query_chunk_size = getattr(
+                self.config, "dsa_sparse_attention_query_chunk_size", None
+            )
+            if sparse_query_chunk_size is None or sparse_query_chunk_size <= 0:
+                sparse_query_chunk_size = getattr(self.config, "dsa_kernel_query_block_size", None)
+            request_output = unfused_grouped_dsa_fn(
+                request_query,
+                request_key,
+                request_value,
+                topk_indices,
+                self.softmax_scale,
+                mask=request_mask,
+                query_chunk_size=sparse_query_chunk_size,
+                use_gather=True,
+            )
+            output[query_start:query_end] = request_output
+
+        if query_cursor != inference_context.active_token_count:
+            raise RuntimeError(
+                f"DSA-GQA dynamic inference consumed {query_cursor} query tokens but context has "
+                f"{inference_context.active_token_count} active tokens."
+            )
+        if is_using_quantization_scales(self.config):
+            output[inference_context.padding_slice] = 0.0
+        return output
+
     def _forward_min_memory(
         self,
         query: torch.Tensor,
@@ -1270,6 +1546,8 @@ class DSGQACoreAttention(MegatronModule):
 class DSGroupedSelfAttention(SelfAttention):
     """Self-attention that swaps in token-level DSA for grouped-query attention."""
 
+    core_attention: DSGQACoreAttention
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1361,3 +1639,53 @@ class DSGroupedSelfAttention(SelfAttention):
             ),
             "indexer_input_norm": indexer_input_norm,
         }
+
+    def _dynamic_core_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context,
+        block_table: torch.Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Dispatch dynamic batching to the paged-cache DSA-GQA implementation."""
+        if self.config.experimental_attention_variant != "dsa":
+            return super()._dynamic_core_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                inference_context,
+                block_table,
+                attn_mask_type,
+                attention_bias,
+                packed_seq_params,
+                hidden_states=hidden_states,
+                use_indexer_rope=use_indexer_rope,
+            )
+        if packed_seq_params is not None:
+            raise NotImplementedError(
+                "Packed sequence is not supported for DSA-GQA dynamic inference."
+            )
+        if inference_context.using_cuda_graph_this_step():
+            raise NotImplementedError("DSA-GQA dynamic inference does not yet support CUDA graphs.")
+
+        provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
+        return self.core_attention.forward_dynamic(
+            query=query,
+            key_cache=key,
+            value_cache=value,
+            hidden_states=hidden_states,
+            inference_context=inference_context,
+            provider_layer_number=provider_layer_number,
+            block_table=block_table,
+            use_indexer_rope=use_indexer_rope,
+            indexer_input_norm=indexer_input_norm,
+        )
