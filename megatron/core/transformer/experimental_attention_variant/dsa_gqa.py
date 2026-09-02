@@ -1212,6 +1212,11 @@ class DSGQACoreAttention(MegatronModule):
         assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
         if getattr(self.config, "dsa_fwd_skip_dsa", False):
             raise NotImplementedError("dsa_fwd_skip_dsa is not supported by dynamic inference.")
+        if getattr(self.config, "dsa_fwd_use_dense_attn", False):
+            raise NotImplementedError(
+                "dsa_fwd_use_dense_attn is a training-only warmup mode and is not supported "
+                "by dynamic inference."
+            )
         if getattr(self.config, "dsa_indexer_mode", "standard") != "simplified":
             raise NotImplementedError(
                 "Dynamic DSA-GQA currently supports simplified indexers only."

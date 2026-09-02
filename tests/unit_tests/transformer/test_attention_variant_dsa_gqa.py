@@ -3599,3 +3599,154 @@ class TestDSGQAInference:
         assert bias is None
         assert output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
         assert output.dtype == dtype
+
+    def test_dsa_gqa_dynamic_matches_training_with_indexer(self, monkeypatch):
+        """Dynamic paged-cache DSA must match full-sequence DSA routing and output."""
+        torch.manual_seed(123)
+        dtype = torch.bfloat16
+        sequence_length = 1024
+        hidden_size = 4096
+        num_attention_heads = 32
+        num_query_groups = 1
+        head_dim = 192
+        topk = 512
+
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            ffn_hidden_size=21376,
+            num_attention_heads=num_attention_heads,
+            num_query_groups=num_query_groups,
+            kv_channels=head_dim,
+            params_dtype=dtype,
+            bf16=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=1.0e-5,
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_simplified_use_learned_k=True,
+            dsa_simplified_indexer_disable_main_input_norm=True,
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=head_dim,
+            dsa_indexer_topk=topk,
+            dsa_fwd_skip_dsa=False,
+            dsa_fwd_use_dense_attn=False,
+            tensor_model_parallel_size=1,
+            sequence_parallel=False,
+        )
+        inference_context = DynamicInferenceContext(
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=131072,
+                max_requests=1,
+                max_tokens=1024,
+                block_size_tokens=256,
+                buffer_size_gb=0.05,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+        inference_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(sequence_length, dtype=torch.long, device="cpu"),
+                sampling_params=SamplingParams(num_tokens_to_generate=1),
+            )
+        )
+        inference_context.initialize_attention_state()
+
+        attention = DSGroupedSelfAttention(
+            config=transformer_config,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                core_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
+            ),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        core_attention = attention.core_attention
+        assert core_attention.dense_core_attention is None
+
+        device = torch.cuda.current_device()
+        query = torch.randn(
+            sequence_length, 1, num_attention_heads, head_dim, dtype=dtype, device=device
+        )
+        key = torch.randn(
+            sequence_length, 1, num_query_groups, head_dim, dtype=dtype, device=device
+        )
+        value = torch.randn_like(key)
+        hidden_states = torch.randn(sequence_length, 1, hidden_size, dtype=dtype, device=device)
+
+        routing = {}
+        dsa_globals = DSGQACoreAttention.forward.__globals__
+        training_topk = dsa_globals["_simplified_qk_topk_naive"]
+        dynamic_topk = dsa_globals["_simplified_qk_topk_batched_nested"]
+
+        def capture_training_topk(*args, **kwargs):
+            scores, indices = training_topk(*args, **kwargs)
+            routing["training"] = indices.detach().clone()
+            return scores, indices
+
+        def capture_dynamic_topk(*args, **kwargs):
+            indices, mask = dynamic_topk(*args, **kwargs)
+            routing["dynamic"] = indices.detach().clone()
+            return indices, mask
+
+        monkeypatch.setitem(dsa_globals, "_simplified_qk_topk_naive", capture_training_topk)
+        monkeypatch.setitem(dsa_globals, "_simplified_qk_topk_batched_nested", capture_dynamic_topk)
+
+        core_attention.train()
+        with torch.no_grad():
+            training_output = core_attention(
+                query,
+                key,
+                value,
+                attention_mask=None,
+                hidden_states=hidden_states,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+        padded_token_count = inference_context.padded_active_token_count
+        query_padded = query.new_zeros(padded_token_count, 1, num_attention_heads, head_dim)
+        key_padded = key.new_zeros(padded_token_count, 1, num_query_groups, head_dim)
+        value_padded = value.new_zeros(padded_token_count, 1, num_query_groups, head_dim)
+        hidden_states_padded = hidden_states.new_zeros(padded_token_count, 1, hidden_size)
+        query_padded[:sequence_length] = query
+        key_padded[:sequence_length] = key
+        value_padded[:sequence_length] = value
+        hidden_states_padded[:sequence_length] = hidden_states
+
+        inference_context.append_key_value_cache(1, key_padded, value_padded)
+        key_cache, value_cache, block_table = inference_context.key_value_cache(1)
+        packed_seq_params = _build_dsa_gqa_dynamic_packed_seq_params(inference_context)
+
+        core_attention.eval()
+        with torch.no_grad():
+            dynamic_output = core_attention.forward_dynamic(
+                query=query_padded,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                hidden_states=hidden_states_padded,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                provider_layer_number=1,
+                block_table=block_table,
+            )[:sequence_length]
+
+        assert set(routing) == {"training", "dynamic"}
+        # The first topk-1 causal rows contain padding slots. Once at least topk keys are
+        # visible, both implementations must select exactly the same sparse support.
+        torch.testing.assert_close(
+            routing["dynamic"][:, topk - 1 :].sort(dim=-1).values,
+            routing["training"][:, topk - 1 :].sort(dim=-1).values,
+            rtol=0,
+            atol=0,
+        )
+        assert routing["dynamic"][0, -1].unique().numel() == topk
+        assert training_output.shape == dynamic_output.shape
+        assert training_output.dtype == dynamic_output.dtype == dtype
+        torch.testing.assert_close(dynamic_output, training_output, rtol=2.0e-2, atol=2.0e-2)
