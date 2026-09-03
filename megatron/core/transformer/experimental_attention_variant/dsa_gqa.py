@@ -26,6 +26,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton import (
+    triton_thd_grouped_indexer_scores,
+    triton_thd_sparse_attention,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -104,9 +108,23 @@ def _simplified_qk_topk_batched_nested(
     """Compute causal simplified-indexer top-k for all dynamic requests in one padded batch."""
     max_query_length = int(query_lengths.max().item())
     max_kv_length = int(kv_lengths.max().item())
-    q_padded = _jagged_to_padded(q_index.float(), query_offsets, max_query_length)
-    k_padded = _jagged_to_padded(index_key.float(), kv_offsets, max_kv_length)
-    scores = torch.bmm(q_padded, k_padded.transpose(1, 2)) * softmax_scale
+    scores = triton_thd_grouped_indexer_scores(
+        q_index,
+        index_key,
+        query_lengths,
+        kv_lengths,
+        request_kv_offsets,
+        query_offsets,
+        kv_offsets,
+        max_query_length,
+        max_kv_length,
+        softmax_scale,
+    )
+    # Fallback path for when Triton kernel is not available.
+    if scores is None:
+        q_padded = _jagged_to_padded(q_index.float(), query_offsets, max_query_length)
+        k_padded = _jagged_to_padded(index_key.float(), kv_offsets, max_kv_length)
+        scores = torch.bmm(q_padded, k_padded.transpose(1, 2)) * softmax_scale
 
     query_positions = torch.arange(max_query_length, device=scores.device)
     key_positions = torch.arange(max_kv_length, device=scores.device)
@@ -565,6 +583,188 @@ def unfused_grouped_dsa_fn(
             query_chunk_size=query_chunk_size,
         )
     return _dense_grouped_dsa_fn(query, key, value, topk_indices, softmax_scale, mask=mask)
+
+
+def _unfused_dynamic_grouped_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    attention_mask: torch.Tensor,
+    query_lengths: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    query_offsets: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    request_start: int,
+    request_end: int,
+    softmax_scale: float,
+    query_chunk_size: Optional[int],
+) -> torch.Tensor:
+    """Run the unfused dynamic path for a contiguous range of packed requests."""
+    if request_start == request_end:
+        return value.new_empty((0, query.size(1), value.size(-1)))
+
+    request_query_lengths = query_lengths[request_start:request_end]
+    request_kv_lengths = kv_lengths[request_start:request_end]
+    max_query_length = int(request_query_lengths.max().item())
+    max_kv_length = int(request_kv_lengths.max().item())
+
+    query_start = 0 if request_start == 0 else int(query_offsets[request_start].item())
+    query_end = (
+        query.size(0)
+        if request_end == query_lengths.numel()
+        else int(query_offsets[request_end].item())
+    )
+    kv_start = 0 if request_start == 0 else int(kv_offsets[request_start].item())
+    kv_end = (
+        key.size(0) if request_end == kv_lengths.numel() else int(kv_offsets[request_end].item())
+    )
+    local_query_offsets = query_offsets[request_start : request_end + 1] - query_start
+    local_kv_offsets = kv_offsets[request_start : request_end + 1] - kv_start
+
+    query_padded = _jagged_to_padded(
+        query[query_start:query_end], local_query_offsets, max_query_length
+    ).permute(1, 0, 2, 3)
+    key_padded = _jagged_to_padded(key[kv_start:kv_end], local_kv_offsets, max_kv_length).permute(
+        1, 0, 2, 3
+    )
+    value_padded = _jagged_to_padded(
+        value[kv_start:kv_end], local_kv_offsets, max_kv_length
+    ).permute(1, 0, 2, 3)
+    padded_output = unfused_grouped_dsa_fn(
+        query_padded,
+        key_padded,
+        value_padded,
+        topk_indices[request_start:request_end, :max_query_length],
+        softmax_scale,
+        mask=attention_mask[request_start:request_end, :max_query_length, :max_kv_length],
+        query_chunk_size=query_chunk_size,
+        use_gather=True,
+    )
+
+    request_count = request_end - request_start
+    total_query_tokens = query_end - query_start
+    query_request_indices = torch.repeat_interleave(
+        torch.arange(request_count, device=query.device),
+        request_query_lengths,
+        output_size=total_query_tokens,
+    )
+    query_positions = (
+        torch.arange(total_query_tokens, device=query.device)
+        - local_query_offsets[query_request_indices]
+    )
+    return padded_output[query_positions, query_request_indices].reshape(
+        total_query_tokens, query.size(1), value.size(-1)
+    )
+
+
+def _dynamic_grouped_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    attention_mask: torch.Tensor,
+    query_lengths: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    request_kv_offsets: torch.Tensor,
+    query_offsets: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    num_decode_requests: int,
+    softmax_scale: float,
+    query_chunk_size: Optional[int],
+) -> torch.Tensor:
+    """Dispatch packed decode and prefill requests to their sparse-attention backends."""
+    request_count = query_lengths.numel()
+    if num_decode_requests < 0 or num_decode_requests > request_count:
+        raise ValueError(
+            f"Expected 0 <= num_decode_requests <= {request_count}, got " f"{num_decode_requests}."
+        )
+
+    if num_decode_requests == 0:
+        return _unfused_dynamic_grouped_dsa_fn(
+            query,
+            key,
+            value,
+            topk_indices,
+            attention_mask,
+            query_lengths,
+            kv_lengths,
+            query_offsets,
+            kv_offsets,
+            0,
+            request_count,
+            softmax_scale,
+            query_chunk_size,
+        )
+
+    total_query_tokens = query.size(0)
+    decode_query_tokens = (
+        total_query_tokens
+        if num_decode_requests == request_count
+        else int(query_offsets[num_decode_requests].item())
+    )
+    decode_query_lengths = query_lengths[:num_decode_requests]
+    decode_query_request_indices = torch.repeat_interleave(
+        torch.arange(num_decode_requests, device=query.device),
+        decode_query_lengths,
+        output_size=decode_query_tokens,
+    )
+    decode_query_positions = (
+        torch.arange(decode_query_tokens, device=query.device)
+        - query_offsets[decode_query_request_indices]
+    )
+    decode_output = triton_thd_sparse_attention(
+        query[:decode_query_tokens],
+        key,
+        value,
+        topk_indices[:num_decode_requests],
+        decode_query_request_indices,
+        decode_query_positions,
+        kv_lengths[:num_decode_requests],
+        request_kv_offsets[:num_decode_requests],
+        kv_offsets[: num_decode_requests + 1],
+        softmax_scale,
+    )
+    if decode_output is None:
+        decode_output = _unfused_dynamic_grouped_dsa_fn(
+            query,
+            key,
+            value,
+            topk_indices,
+            attention_mask,
+            query_lengths,
+            kv_lengths,
+            query_offsets,
+            kv_offsets,
+            0,
+            num_decode_requests,
+            softmax_scale,
+            query_chunk_size,
+        )
+
+    if num_decode_requests == request_count:
+        return decode_output
+
+    output = value.new_empty((total_query_tokens, query.size(1), value.size(-1)))
+    output[:decode_query_tokens] = decode_output
+
+    output[decode_query_tokens:] = _unfused_dynamic_grouped_dsa_fn(
+        query,
+        key,
+        value,
+        topk_indices,
+        attention_mask,
+        query_lengths,
+        kv_lengths,
+        query_offsets,
+        kv_offsets,
+        num_decode_requests,
+        request_count,
+        softmax_scale,
+        query_chunk_size,
+    )
+
+    return output
 
 
 @dataclass
@@ -1210,14 +1410,14 @@ class DSGQACoreAttention(MegatronModule):
         """Run simplified DSA-GQA over the dynamic-inference paged cache."""
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
-        if getattr(self.config, "dsa_fwd_skip_dsa", False):
+        if self.config.dsa_fwd_skip_dsa:
             raise NotImplementedError("dsa_fwd_skip_dsa is not supported by dynamic inference.")
-        if getattr(self.config, "dsa_fwd_use_dense_attn", False):
+        if self.config.dsa_fwd_use_dense_attn:
             raise NotImplementedError(
                 "dsa_fwd_use_dense_attn is a training-only warmup mode and is not supported "
                 "by dynamic inference."
             )
-        if getattr(self.config, "dsa_indexer_mode", "standard") != "simplified":
+        if self.config.dsa_indexer_mode != "simplified":
             raise NotImplementedError(
                 "Dynamic DSA-GQA currently supports simplified indexers only."
             )
@@ -1230,6 +1430,7 @@ class DSGQACoreAttention(MegatronModule):
             raise ValueError(
                 f"DSA-GQA dynamic inference expected a 3-D THD or 4-D query, got {query.shape}."
             )
+
         sq, batch_size, num_query_heads, _ = query.size()
         assert batch_size == 1, "Dynamic DSA-GQA expects a flattened token layout with batch=1."
         value_head_dim = value_cache.size(-1)
@@ -1240,9 +1441,10 @@ class DSGQACoreAttention(MegatronModule):
         if active_request_count == 0:
             return output
 
-        simplified_learned_k = getattr(self.config, "dsa_simplified_use_learned_k", False)
+        simplified_learned_k = self.config.dsa_simplified_use_learned_k
         if _simplified_indexer_uses_main_input_norm(self.config):
             hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
+
         main_block_table = block_table[:active_request_count]
         if simplified_learned_k:
             q_index, k_index_current = self.indexer.forward_qk_dynamic(
@@ -1256,20 +1458,13 @@ class DSGQACoreAttention(MegatronModule):
             )
             dsa_key_cache = None
             dsa_block_table = None
-
         state_data = inference_context.active_attn_metadata["mha_metadata"].state_data
         query_lengths = state_data["query_lengths"][:active_request_count].to(torch.long)
         kv_lengths = state_data["kv_seq_lengths"][:active_request_count].to(torch.long)
 
         cu_q_seqlens, _ = inference_context.cu_query_lengths()
         cu_q_seqlens = cu_q_seqlens[: active_request_count + 1].to(torch.long)
-        total_query_tokens = int(cu_q_seqlens[-1].item())
-        if packed_seq_params.total_tokens != total_query_tokens:
-            raise RuntimeError(
-                "DSA-GQA dynamic inference packed-sequence metadata has "
-                f"{packed_seq_params.total_tokens} query tokens, but the inference context has "
-                f"{total_query_tokens}."
-            )
+        total_query_tokens = packed_seq_params.total_tokens
         if total_query_tokens != inference_context.active_token_count:
             raise RuntimeError(
                 f"DSA-GQA dynamic inference received {total_query_tokens} query tokens but "
@@ -1291,7 +1486,6 @@ class DSGQACoreAttention(MegatronModule):
             index_key_packed = dsa_key_cache[dsa_blocks, dsa_positions]
         else:
             index_key_packed = key_packed[:, 0, :]
-
         request_kv_offsets = inference_context.gpu_view.request_kv_length_offsets[
             :active_request_count
         ].to(torch.long)
@@ -1306,40 +1500,26 @@ class DSGQACoreAttention(MegatronModule):
             self.indexer.index_topk,
             self.indexer.softmax_scale,
         )
-
-        max_query_length = int(query_lengths.max().item())
-        max_kv_length = int(kv_lengths.max().item())
-        query_padded = _jagged_to_padded(
-            query[:total_query_tokens, 0], cu_q_seqlens, max_query_length
-        ).permute(1, 0, 2, 3)
-        key_padded = _jagged_to_padded(key_packed, kv_offsets, max_kv_length).permute(1, 0, 2, 3)
-        value_padded = _jagged_to_padded(value_packed, kv_offsets, max_kv_length).permute(
-            1, 0, 2, 3
-        )
         sparse_query_chunk_size = getattr(
             self.config, "dsa_sparse_attention_query_chunk_size", None
         )
-        padded_output = unfused_grouped_dsa_fn(
-            query_padded,
-            key_padded,
-            value_padded,
+        sparse_output = _dynamic_grouped_dsa_fn(
+            query[:total_query_tokens, 0],
+            key_packed,
+            value_packed,
             topk_indices,
-            self.softmax_scale,
-            mask=attention_mask,
-            query_chunk_size=sparse_query_chunk_size,
-            use_gather=True,
-        )
-
-        query_request_indices = torch.repeat_interleave(
-            torch.arange(active_request_count, device=query.device),
+            attention_mask,
             query_lengths,
-            output_size=total_query_tokens,
+            kv_lengths,
+            request_kv_offsets,
+            cu_q_seqlens,
+            kv_offsets,
+            inference_context.num_decode_requests,
+            self.softmax_scale,
+            sparse_query_chunk_size,
         )
-        query_positions = (
-            torch.arange(total_query_tokens, device=query.device)
-            - cu_q_seqlens[query_request_indices]
-        )
-        output[:total_query_tokens, 0] = padded_output[query_positions, query_request_indices]
+        output[:total_query_tokens, 0] = sparse_output.flatten(1)
+
         if is_using_quantization_scales(self.config):
             output[inference_context.padding_slice] = 0.0
         return output

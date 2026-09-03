@@ -31,6 +31,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
     SimplifiedDSGQAIndexer,
     SimplifiedDSGQAIndexerSubmodules,
+    _cumulative_sequence_lengths,
     _DSAZeroParamDependency,
     _indexer_input_norm_spec,
     _normalized_indexer_input,
@@ -39,6 +40,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     _simplified_indexer_norm_spec,
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton import (
+    HAVE_TRITON as HAVE_DSA_GQA_TRITON,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton import (
+    triton_thd_grouped_indexer_scores,
+    triton_thd_sparse_attention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import dsa_stack_spec
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
@@ -3474,6 +3482,273 @@ def _build_dsa_gqa_dynamic_packed_seq_params(
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_DSA_GQA_TRITON, reason="CUDA Triton only"
+)
+def test_triton_thd_grouped_indexer_scores_matches_variable_length_reference():
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim = 192
+    query_lengths = torch.tensor([7, 3, 1], dtype=torch.int64, device=device)
+    kv_lengths = torch.tensor([11, 6, 4], dtype=torch.int64, device=device)
+    request_kv_offsets = kv_lengths - query_lengths
+    query_offsets = _cumulative_sequence_lengths(query_lengths)
+    kv_offsets = _cumulative_sequence_lengths(kv_lengths)
+    max_query_length = int(query_lengths.max().item())
+    max_kv_length = int(kv_lengths.max().item())
+    softmax_scale = head_dim**-0.5
+    q = torch.randn(int(query_offsets[-1].item()), head_dim, dtype=dtype, device=device)
+    k = torch.randn(int(kv_offsets[-1].item()), head_dim, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        actual = triton_thd_grouped_indexer_scores(
+            q,
+            k,
+            query_lengths,
+            kv_lengths,
+            request_kv_offsets,
+            query_offsets,
+            kv_offsets,
+            max_query_length,
+            max_kv_length,
+            softmax_scale,
+        )
+
+    assert actual is not None
+    expected = torch.full_like(actual, -float("inf"))
+    for request_idx in range(query_lengths.numel()):
+        query_length = int(query_lengths[request_idx].item())
+        kv_length = int(kv_lengths[request_idx].item())
+        query_start = int(query_offsets[request_idx].item())
+        kv_start = int(kv_offsets[request_idx].item())
+        request_scores = torch.mm(
+            q[query_start : query_start + query_length].float(),
+            k[kv_start : kv_start + kv_length].float().t(),
+        )
+        request_scores *= softmax_scale
+        query_positions = torch.arange(query_length, device=device)
+        key_positions = torch.arange(kv_length, device=device)
+        causal = key_positions.view(1, -1) <= (
+            request_kv_offsets[request_idx] + query_positions.view(-1, 1)
+        )
+        expected[request_idx, :query_length, :kv_length] = request_scores.masked_fill(
+            ~causal, -float("inf")
+        )
+        expected[request_idx, query_length:, 0] = 0.0
+
+    assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
+    finite = torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_DSA_GQA_TRITON, reason="CUDA Triton only"
+)
+def test_triton_thd_sparse_attention_matches_variable_length_reference():
+    torch.manual_seed(321)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_query_heads = 4
+    num_query_groups = 1
+    head_dim = 192
+    value_dim = 192
+    topk = 5
+    query_lengths = torch.tensor([7, 3, 1], dtype=torch.int64, device=device)
+    kv_lengths = torch.tensor([7, 6, 4], dtype=torch.int64, device=device)
+    request_kv_offsets = kv_lengths - query_lengths
+    query_offsets = _cumulative_sequence_lengths(query_lengths)
+    kv_offsets = _cumulative_sequence_lengths(kv_lengths)
+    total_query_tokens = int(query_offsets[-1].item())
+    total_kv_tokens = int(kv_offsets[-1].item())
+    query = torch.randn(total_query_tokens, num_query_heads, head_dim, dtype=dtype, device=device)
+    key = torch.randn(total_kv_tokens, num_query_groups, head_dim, dtype=dtype, device=device)
+    value = torch.randn(total_kv_tokens, num_query_groups, value_dim, dtype=dtype, device=device)
+    topk_indices = torch.full(
+        (query_lengths.numel(), int(query_lengths.max().item()), topk),
+        -1,
+        dtype=torch.int64,
+        device=device,
+    )
+    for request_idx in range(query_lengths.numel()):
+        query_length = int(query_lengths[request_idx].item())
+        request_kv_offset = int(request_kv_offsets[request_idx].item())
+        for query_position in range(query_length):
+            causal_length = request_kv_offset + query_position + 1
+            valid_count = min(topk, causal_length)
+            topk_indices[request_idx, query_position, :valid_count] = torch.arange(
+                causal_length - valid_count, causal_length, device=device
+            )
+
+    query_request_indices = torch.repeat_interleave(
+        torch.arange(query_lengths.numel(), device=device),
+        query_lengths,
+        output_size=total_query_tokens,
+    )
+    query_positions = (
+        torch.arange(total_query_tokens, device=device) - query_offsets[query_request_indices]
+    )
+    softmax_scale = head_dim**-0.5
+    with torch.no_grad():
+        actual = triton_thd_sparse_attention(
+            query,
+            key,
+            value,
+            topk_indices,
+            query_request_indices,
+            query_positions,
+            kv_lengths,
+            request_kv_offsets,
+            kv_offsets,
+            softmax_scale,
+        )
+
+    assert actual is not None
+    expected = torch.empty_like(actual)
+    for request_idx in range(query_lengths.numel()):
+        query_length = int(query_lengths[request_idx].item())
+        kv_length = int(kv_lengths[request_idx].item())
+        query_start = int(query_offsets[request_idx].item())
+        kv_start = int(kv_offsets[request_idx].item())
+        local_query_positions = torch.arange(query_length, device=device)
+        local_key_positions = torch.arange(kv_length, device=device)
+        valid = local_key_positions.view(1, -1) <= (
+            request_kv_offsets[request_idx] + local_query_positions.view(-1, 1)
+        )
+        attention_mask = torch.zeros(
+            (1, query_length, kv_length), dtype=torch.float32, device=device
+        ).masked_fill(~valid.unsqueeze(0), -float("inf"))
+        request_output = unfused_grouped_dsa_fn(
+            query[query_start : query_start + query_length].unsqueeze(1),
+            key[kv_start : kv_start + kv_length].unsqueeze(1),
+            value[kv_start : kv_start + kv_length].unsqueeze(1),
+            topk_indices[request_idx : request_idx + 1, :query_length],
+            softmax_scale,
+            mask=attention_mask,
+            use_gather=True,
+        )
+        expected[query_start : query_start + query_length] = request_output[:, 0].view(
+            query_length, num_query_heads, value_dim
+        )
+
+    assert actual.shape == (total_query_tokens, num_query_heads, value_dim)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_DSA_GQA_TRITON, reason="CUDA Triton only"
+)
+def test_dynamic_grouped_dsa_dispatches_mixed_prefill_decode(monkeypatch):
+    """A mixed THD batch sends decode requests to Triton and prefill to unfused DSA."""
+    torch.manual_seed(456)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_query_heads = 32
+    num_query_groups = 1
+    head_dim = 192
+    value_dim = 192
+    topk = 8
+    num_decode_requests = 1
+    query_lengths = torch.tensor([1, 7, 3], dtype=torch.int64, device=device)
+    kv_lengths = torch.tensor([17, 7, 9], dtype=torch.int64, device=device)
+    request_kv_offsets = kv_lengths - query_lengths
+    query_offsets = _cumulative_sequence_lengths(query_lengths)
+    kv_offsets = _cumulative_sequence_lengths(kv_lengths)
+    total_query_tokens = int(query_offsets[-1].item())
+    total_kv_tokens = int(kv_offsets[-1].item())
+    query = torch.randn(total_query_tokens, num_query_heads, head_dim, dtype=dtype, device=device)
+    key = torch.randn(total_kv_tokens, num_query_groups, head_dim, dtype=dtype, device=device)
+    value = torch.randn(total_kv_tokens, num_query_groups, value_dim, dtype=dtype, device=device)
+
+    max_query_length = int(query_lengths.max().item())
+    max_kv_length = int(kv_lengths.max().item())
+    topk_indices = torch.full(
+        (query_lengths.numel(), max_query_length, topk), -1, dtype=torch.int64, device=device
+    )
+    attention_mask = torch.full(
+        (query_lengths.numel(), max_query_length, max_kv_length),
+        -float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    for request_idx in range(query_lengths.numel()):
+        query_length = int(query_lengths[request_idx].item())
+        kv_length = int(kv_lengths[request_idx].item())
+        kv_offset = int(request_kv_offsets[request_idx].item())
+        for query_position in range(query_length):
+            causal_length = kv_offset + query_position + 1
+            valid_count = min(topk, causal_length)
+            topk_indices[request_idx, query_position, :valid_count] = torch.arange(
+                causal_length - valid_count, causal_length, device=device
+            )
+            attention_mask[request_idx, query_position, :causal_length] = 0.0
+
+    dsa_globals = DSGQACoreAttention.forward.__globals__
+    dynamic_attention = dsa_globals["_dynamic_grouped_dsa_fn"]
+    triton_attention = dsa_globals["triton_thd_sparse_attention"]
+    unfused_attention = dsa_globals["unfused_grouped_dsa_fn"]
+    triton_calls = []
+    unfused_calls = []
+
+    def capture_triton_attention(*args, **kwargs):
+        triton_calls.append((args[0].size(0), args[6].numel()))
+        return triton_attention(*args, **kwargs)
+
+    def capture_unfused_attention(*args, **kwargs):
+        unfused_calls.append((args[0].size(0), args[0].size(1)))
+        return unfused_attention(*args, **kwargs)
+
+    monkeypatch.setitem(dsa_globals, "triton_thd_sparse_attention", capture_triton_attention)
+    monkeypatch.setitem(dsa_globals, "unfused_grouped_dsa_fn", capture_unfused_attention)
+
+    softmax_scale = head_dim**-0.5
+    with torch.no_grad():
+        actual = dynamic_attention(
+            query,
+            key,
+            value,
+            topk_indices,
+            attention_mask,
+            query_lengths,
+            kv_lengths,
+            request_kv_offsets,
+            query_offsets,
+            kv_offsets,
+            num_decode_requests,
+            softmax_scale,
+            None,
+        )
+
+    # The decode request has one packed query token. The two prefill requests are
+    # padded together to their maximum query length of seven.
+    assert triton_calls == [(1, 1)]
+    assert unfused_calls == [(7, 2)]
+
+    expected = torch.empty_like(actual)
+    for request_idx in range(query_lengths.numel()):
+        query_length = int(query_lengths[request_idx].item())
+        kv_length = int(kv_lengths[request_idx].item())
+        query_start = int(query_offsets[request_idx].item())
+        kv_start = int(kv_offsets[request_idx].item())
+        request_output = unfused_attention(
+            query[query_start : query_start + query_length].unsqueeze(1),
+            key[kv_start : kv_start + kv_length].unsqueeze(1),
+            value[kv_start : kv_start + kv_length].unsqueeze(1),
+            topk_indices[request_idx : request_idx + 1, :query_length],
+            softmax_scale,
+            mask=attention_mask[request_idx : request_idx + 1, :query_length, :kv_length],
+            use_gather=True,
+        )
+        expected[query_start : query_start + query_length] = request_output[:, 0].reshape(
+            query_length, num_query_heads, value_dim
+        )
+
+    assert actual.shape == (total_query_tokens, num_query_heads, value_dim)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
 class TestDSGQAInference:
     @pytest.fixture(scope="function", autouse=True)
     def setup_method(self):
@@ -3599,6 +3874,50 @@ class TestDSGQAInference:
         assert bias is None
         assert output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
         assert output.dtype == dtype
+
+        # Advance the existing requests to decode, then admit a new prefill request. This is
+        # the request ordering used by a real dynamic prefill/decode mixed step.
+        inference_context.update_requests(
+            active_requests_mask=torch.ones(len(prompt_lengths), dtype=torch.int32),
+            new_tokens=torch.arange(100, 100 + len(prompt_lengths), dtype=torch.long),
+        )
+        mixed_prefill_length = 6
+        inference_context.add_request(
+            DynamicInferenceRequest(
+                request_id=len(prompt_lengths),
+                prompt_tokens=torch.arange(
+                    token_offset,
+                    token_offset + mixed_prefill_length,
+                    dtype=torch.long,
+                    device="cpu",
+                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=1),
+            )
+        )
+        inference_context.initialize_attention_state()
+        assert inference_context.num_decode_requests == len(prompt_lengths)
+        assert inference_context.num_prefill_requests == 1
+        assert inference_context.active_token_count == len(prompt_lengths) + mixed_prefill_length
+
+        mixed_hidden_states = torch.randn(
+            inference_context.padded_active_token_count,
+            1,
+            hidden_size,
+            dtype=dtype,
+            device=torch.cuda.current_device(),
+        )
+        mixed_packed_seq_params = _build_dsa_gqa_dynamic_packed_seq_params(inference_context)
+        with torch.inference_mode(), InferenceMode.active():
+            mixed_output, mixed_bias = attention(
+                hidden_states=mixed_hidden_states,
+                attention_mask=None,
+                inference_context=inference_context,
+                packed_seq_params=mixed_packed_seq_params,
+            )
+
+        assert mixed_bias is None
+        assert mixed_output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
+        assert mixed_output.dtype == dtype
 
     def test_dsa_gqa_dynamic_matches_training_with_indexer(self, monkeypatch):
         """Dynamic paged-cache DSA must match full-sequence DSA routing and output."""
@@ -3749,4 +4068,4 @@ class TestDSGQAInference:
         assert routing["dynamic"][0, -1].unique().numel() == topk
         assert training_output.shape == dynamic_output.shape
         assert training_output.dtype == dynamic_output.dtype == dtype
-        torch.testing.assert_close(dynamic_output, training_output, rtol=2.0e-2, atol=2.0e-2)
+        torch.testing.assert_close(dynamic_output, training_output, rtol=2e-2, atol=2e-2)
