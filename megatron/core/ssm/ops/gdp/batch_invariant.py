@@ -21,6 +21,8 @@ The FP32 state is committed only at fixed block boundaries. Cache right-hand
 sides and inverse-factor rows are BF16; all mode switches preserve this contract.
 """
 
+# pylint: disable=missing-function-docstring
+
 from dataclasses import dataclass
 
 import torch
@@ -299,6 +301,108 @@ def _forward(
 
 
 @triton.jit(do_not_specialize=["N"])
+def _forward_prepared(
+    Q,
+    K,
+    V,
+    G,
+    Beta,
+    Slots,
+    State,
+    Keys,
+    Gates,
+    Factors,
+    Rhs,
+    Cursor,
+    O,
+    TapeS,
+    TapeT,
+    TapeH,
+    TapeU,
+    Prefix,
+    Cu,
+    SS: tl.constexpr,
+    KS: tl.constexpr,
+    GS: tl.constexpr,
+    FS: tl.constexpr,
+    HS: tl.constexpr,
+    CS: tl.constexpr,
+    N,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    R: tl.constexpr,
+    C: tl.constexpr,
+    SCALE: tl.constexpr,
+    TAPE: tl.constexpr,
+    PREPARED: tl.constexpr,
+    OUTPUTS: tl.constexpr,
+    VARLEN: tl.constexpr,
+    BV: tl.constexpr,
+    PIPE_STAGES: tl.constexpr,
+):
+    tl.static_assert(PREPARED and TAPE and not OUTPUTS and not VARLEN)
+    bh = tl.program_id(0)
+    batch, head = bh // H, bh % H
+    slot = tl.load(Slots + batch)
+    cs, ds = tl.arange(0, C), tl.arange(0, D)
+    vs = tl.program_id(1) * BV + tl.arange(0, BV)
+    so = slot * SS + head * D * W + ds[:, None] * W + vs[None, :]
+    state = tl.load(State + so)
+    nb = tl.cdiv(N * R, C)
+    rhs = tl.full((C, BV), 0.0, tl.bfloat16)
+    for block in tl.range(nb, num_stages=PIPE_STAGES):
+        row = block * C + cs
+        valid = row < N * R
+        token, rid = row // R, row % R
+        base = ((batch * N + token) * R + rid) * H + head
+        key = tl.load(K + base[:, None] * D + ds[None, :], valid[:, None], other=0)
+        value = tl.load(V + base[:, None] * W + vs[None, :], valid[:, None], other=0)
+        beta = tl.load(Beta + base, valid, other=0)
+        ti = (batch * nb + block) * H + head
+        p = tl.load(Prefix + ti * C + cs)
+        factor = tl.load(TapeT + ti * C * C + cs[:, None] * C + cs[None, :])
+        decay = tl.exp(p)
+        sb = state.to(tl.bfloat16)
+        projection = tl.dot(key, sb)
+        rhs = _right_hand_side(value.to(tl.float32), decay[:, None], projection, beta[:, None]).to(
+            tl.bfloat16
+        )
+        rhs = tl.where(valid[:, None], rhs, 0.0).to(tl.bfloat16)
+        u = tl.dot(factor, rhs).to(tl.bfloat16)
+        tl.store(TapeS + ti * D * W + ds[:, None] * W + vs[None, :], state)
+        tl.store(TapeH + ti * C * W + cs[:, None] * W + vs[None, :], rhs)
+        tl.store(TapeU + ti * C * W + cs[:, None] * W + vs[None, :], u)
+        if (block + 1) * C <= N * R:
+            last = tl.sum(tl.where(cs == C - 1, p, 0.0), 0)
+            f = (key.to(tl.float32) * tl.exp(last - p)[:, None]).to(tl.bfloat16)
+            state = state * tl.exp(last) + tl.dot(tl.trans(f), u)
+    tl.store(State + so, state)
+    # Materialize the partial block exactly as the incremental kernel expects.
+    pos = N * R % C
+    row = (nb - 1) * C + cs
+    token, rid = row // R, row % R
+    base = ((batch * N + token) * R + rid) * H + head
+    valid = cs < pos
+    if tl.program_id(1) == 0:
+        key = tl.load(K + base[:, None] * D + ds[None, :], valid[:, None], other=0)
+        gate = tl.load(G + (batch * N + token) * H + head, valid & (rid == 0), other=0)
+        ti = (batch * nb + nb - 1) * H + head
+        factor = tl.load(TapeT + ti * C * C + cs[:, None] * C + cs[None, :])
+        tl.store(Keys + slot * KS + head * C * D + cs[:, None] * D + ds[None, :], key)
+        tl.store(Gates + slot * GS + head * C + cs, gate)
+        tl.store(
+            Factors + slot * FS + head * C * C + cs[:, None] * C + cs[None, :],
+            tl.where(valid[:, None], factor, 0.0),
+        )
+        tl.store(Cursor + slot * CS + head, pos)
+    tl.store(
+        Rhs + slot * HS + head * C * W + cs[:, None] * W + vs[None, :],
+        tl.where(valid[:, None], rhs, 0.0),
+    )
+
+
+@triton.jit(do_not_specialize=["N"])
 def _outputs(
     Q,
     K,
@@ -570,7 +674,23 @@ def _run(
         )
     out = torch.empty((b, t, h, w), device=q.device, dtype=q.dtype)
     forward_tile = min(w, 16) if prepared and b * h < 128 else w
-    _forward[(requests * h, triton.cdiv(w, forward_tile))](
+    # Keep the arithmetic block size fixed. This launch specialization was
+    # measured on Blackwell for the C32/K128/V64 prepared-recurrence path.
+    tuned_shape = (
+        prepared
+        and c == 32
+        and d == 128
+        and w == 64
+        and torch.cuda.get_device_capability(q.device)[0] == 10
+    )
+    use_prepared_scan = tuned_shape and b * h < 128
+    if tuned_shape:
+        forward_tile = 16 if b * h < 128 else 32
+    forward_kernel = _forward_prepared if use_prepared_scan else _forward
+    forward_launch = {"num_warps": 2 if use_prepared_scan else 4, "enable_fp_fusion": False}
+    if use_prepared_scan:
+        forward_launch["PIPE_STAGES"] = 3 if b * h <= 32 else 1
+    forward_kernel[(requests * h, triton.cdiv(w, forward_tile))](
         q,
         k,
         v,
@@ -598,8 +718,7 @@ def _run(
         not prepared,
         cu_seqlens is not None,
         forward_tile,
-        num_warps=4,
-        enable_fp_fusion=False,
+        **forward_launch,
     )
     if prepared:
         _outputs[(nb, b * h)](
